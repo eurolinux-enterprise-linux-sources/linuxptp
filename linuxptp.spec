@@ -1,8 +1,9 @@
-%global gitdate	20140318
-%global gitrev	2b099c
+%global testsuite_ver 7c523f
+%global clknetsim_ver 592d17
+
 Name:		linuxptp
-Version:	1.4
-Release:	2.%{gitdate}git%{gitrev}%{?dist}
+Version:	1.5
+Release:	2%{?dist}
 Summary:	PTP implementation for Linux
 ExclusiveArch:	%{ix86} x86_64 ppc ppc64
 
@@ -10,17 +11,20 @@ Group:		System Environment/Base
 License:	GPLv2+
 URL:		http://linuxptp.sourceforge.net/
 
-#Source0:      http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tgz
-# git clone git://git.code.sf.net/p/linuxptp/code linuxptp; cd linuxptp
-# git archive --prefix=linuxptp-%{version}/ %{gitrev} | \
-# gzip > linuxptp-%{gitdate}git%{gitrev}.tar.gz
-Source0:	%{name}-%{gitdate}git%{gitrev}.tar.gz
+Source0:	http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tgz
 Source1:	phc2sys.init
 Source2:	ptp4l.init
-# test suite from https://github.com/mlichvar/linuxptp-testsuite.git
-Source3:	testsuite-76d0c2.tar.gz
-# simulator for test suite from https://github.com/mlichvar/clknetsim.git
-Source4:	clknetsim-8a7f9e.tar.gz
+Source3:	timemaster.init
+Source4:	timemaster.conf
+# external test suite
+Source10:	https://github.com/mlichvar/linuxptp-testsuite/archive/%{testsuite_ver}/linuxptp-testsuite-%{testsuite_ver}.tar.gz
+# simulator for test suite
+Source11:	https://github.com/mlichvar/clknetsim/archive/%{clknetsim_ver}/clknetsim-%{clknetsim_ver}.tar.gz
+
+Patch1:		linuxptp-rhdoc.patch
+Patch2:		linuxptp-ntpmode.patch
+Patch3:		linuxptp-phc2sys_reconf.patch
+Patch4:		linuxptp-timemaster_kill.patch
 
 BuildRequires:	kernel-headers > 2.6.32-477
 
@@ -36,8 +40,13 @@ Application Programming Interfaces (API) offered by the Linux kernel.
 Supporting legacy APIs and other platforms is not a goal.
 
 %prep
-%setup -q -a 3 -a 4
-mv clknetsim testsuite
+%setup -q -a 10 -a 11
+%patch2 -p1 -b .ntpmode
+%patch1 -p1 -b .rhdoc
+%patch3 -p1 -b .phc2sys_reconf
+%patch4 -p1 -b .timemaster_kill
+mv linuxptp-testsuite-%{testsuite_ver}* testsuite
+mv clknetsim-%{clknetsim_ver}* testsuite/clknetsim
 
 %build
 make %{?_smp_mflags} \
@@ -51,12 +60,15 @@ mkdir -p $RPM_BUILD_ROOT{%{_sysconfdir}/sysconfig,%{_initrddir},%{_mandir}/man5}
 install -m 644 -p default.cfg $RPM_BUILD_ROOT%{_sysconfdir}/ptp4l.conf
 install -m 755 -p %{SOURCE1} $RPM_BUILD_ROOT%{_initrddir}/phc2sys
 install -m 755 -p %{SOURCE2} $RPM_BUILD_ROOT%{_initrddir}/ptp4l
+install -m 755 -p %{SOURCE3} $RPM_BUILD_ROOT%{_initrddir}/timemaster
+install -m 644 -p %{SOURCE4} $RPM_BUILD_ROOT%{_sysconfdir}
 
 echo 'OPTIONS="-f /etc/ptp4l.conf -i eth0"' > \
 	$RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/ptp4l
-echo 'OPTIONS="-w -s eth0"' > $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/phc2sys
+echo 'OPTIONS="-a -r"' > $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/phc2sys
 
 echo '.so man8/ptp4l.8' > $RPM_BUILD_ROOT%{_mandir}/man5/ptp4l.conf.5
+echo '.so man8/timemaster.8' > $RPM_BUILD_ROOT%{_mandir}/man5/timemaster.conf.5
 
 %check
 cd testsuite
@@ -66,6 +78,7 @@ PATH=..:$PATH ./run
 %post
 /sbin/chkconfig --add ptp4l
 /sbin/chkconfig --add phc2sys
+/sbin/chkconfig --add timemaster
 :
 
 %preun
@@ -74,6 +87,8 @@ if [ "$1" -eq 0 ]; then
 	/sbin/chkconfig --del phc2sys
 	/sbin/service ptp4l stop &> /dev/null
 	/sbin/chkconfig --del ptp4l
+	/sbin/service timemaster stop &> /dev/null
+	/sbin/chkconfig --del timemaster
 fi
 :
 
@@ -81,6 +96,7 @@ fi
 if [ "$1" -ge 1 ]; then
 	/sbin/service ptp4l condrestart &> /dev/null
 	/sbin/service phc2sys condrestart &> /dev/null
+	/sbin/service timemaster condrestart &> /dev/null
 fi
 :
 
@@ -89,16 +105,27 @@ fi
 %config(noreplace) %{_sysconfdir}/ptp4l.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/phc2sys
 %config(noreplace) %{_sysconfdir}/sysconfig/ptp4l
+%config(noreplace) %{_sysconfdir}/timemaster.conf
 %{_initrddir}/phc2sys
 %{_initrddir}/ptp4l
+%{_initrddir}/timemaster
 %{_sbindir}/hwstamp_ctl
 %{_sbindir}/phc2sys
+%{_sbindir}/phc_ctl
 %{_sbindir}/pmc
 %{_sbindir}/ptp4l
+%{_sbindir}/timemaster
 %{_mandir}/man5/*.5*
 %{_mandir}/man8/*.8*
 
 %changelog
+* Mon May 18 2015 Miroslav Lichvar <mlichvar@redhat.com> 1.5-2
+- kill timemaster processes by PID instead of process group (#1221514)
+
+* Wed Feb 18 2015 Miroslav Lichvar <mlichvar@redhat.com> 1.5-1
+- update to 1.5 (#1190222, #1085584)
+- use pidfiles in init scripts
+
 * Tue Jun 10 2014 Miroslav Lichvar <mlichvar@redhat.com> 1.4-2.20140318git2b099c
 - build also on ppc and ppc64 (#1095400)
 

@@ -1,0 +1,35 @@
+commit 09e5e6e934814a0ce3528822a35b7f89b0ce8e11
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Tue Feb 10 16:54:43 2015 +0100
+
+    phc2sys: don't synchronize clock to itself in automatic mode.
+    
+    When no source is found in the automatic mode and a clock is selected as
+    the default source, set its state temporarily to slave to prevent the
+    clock from being synchronized to itself and drifting quickly away.
+    
+    Also, don't use this mode with only one PTP clock and don't include the
+    system clock.
+    
+    This fixes phc2sys with SHM servo (e.g. used by timemaster).
+
+diff --git a/phc2sys.c b/phc2sys.c
+index d59814d..23993ac 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -332,9 +332,14 @@ static void reconfigure(struct node *node)
+ 		}
+ 		last = c;
+ 	}
+-	if (dst_cnt && !src) {
++	if (dst_cnt > 1 && !src) {
+ 		if (!rt || rt->dest_only) {
+ 			node->master = last;
++			/* Reset to original state in next reconfiguration. */
++			node->master->new_state = node->master->state;
++			node->master->state = PS_SLAVE;
++			if (rt)
++				rt->state = PS_SLAVE;
+ 			pr_info("no source, selecting %s as the default clock",
+ 				last->device);
+ 			return;

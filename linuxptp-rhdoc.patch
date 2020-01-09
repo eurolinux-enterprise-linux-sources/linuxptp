@@ -1,0 +1,21 @@
+diff -up linuxptp-1.5/timemaster.8.rhdoc linuxptp-1.5/timemaster.8
+--- linuxptp-1.5/timemaster.8.rhdoc	2015-02-13 17:33:31.187612561 +0100
++++ linuxptp-1.5/timemaster.8	2015-02-13 17:43:29.502906892 +0100
+@@ -255,12 +255,15 @@ the \fBntpd\fR SHM refclock driver have
+ are created with world access, which allows any user on the system to write to
+ the segments and disrupt or take control over the synchronization of the clock.
+ In 4.2.8p1 the access was made configurable with the mode option, which is set
+-by \fBtimemaster\fR for owner-ownly access.
++by \fBtimemaster\fR for owner-ownly access. (in Red Hat Enterprise Linux 6 it
++is configurable in ntp-4.2.6p5-3.el6 and later)
+ 
+ The shortest polling interval for all sources is 3 (8 seconds).
+ 
+ Nanosecond resolution in the SHM refclock driver is supported in version
+-4.2.7p303 and later, older versions have only microsecond resolution.
++4.2.7p303 and later, older versions have only microsecond resolution. (in Red
++Hat Enterprise Linux 6 nanosecond resolution is supported in ntp-4.2.6p5-3.el6
++and later)
+ .RE
+ 
+ .SH EXAMPLES

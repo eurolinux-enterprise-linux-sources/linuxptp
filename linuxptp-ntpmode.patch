@@ -1,0 +1,45 @@
+commit e9ac26f909dc7ebc99600043ebd57e9a1d13fcd5
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Feb 9 14:53:06 2015 +0100
+
+    timemaster: set mode in ntp config to create private SHM segments.
+    
+    In ntp-4.2.8p1 the segment access was made configurable with the
+    refclock mode option. Set the mode to 1 to create all SHM segments
+    with owner-only access.
+
+diff --git a/timemaster.8 b/timemaster.8
+index 9a3ddb4..062322b 100644
+--- a/timemaster.8
++++ b/timemaster.8
+@@ -250,10 +250,12 @@ for PTP sources (\fBntp_poll\fR) to specify a subsecond interval.
+ The \fBntpd\fR limitations are:
+ 
+ .RS
+-Only the first two shared-memory segments created by the SHM refclock driver
+-in \fBntpd\fR have owner-only access. Other segments are created with world
+-access, possibly allowing any user on the system writing to the segments and
+-disrupting the synchronization.
++In versions before 4.2.8p1, only the first two shared-memory segments created by
++the \fBntpd\fR SHM refclock driver have owner-only access. Other segments
++are created with world access, which allows any user on the system to write to
++the segments and disrupt or take control over the synchronization of the clock.
++In 4.2.8p1 the access was made configurable with the mode option, which is set
++by \fBtimemaster\fR for owner-ownly access.
+ 
+ The shortest polling interval for all sources is 3 (8 seconds).
+ 
+diff --git a/timemaster.c b/timemaster.c
+index 83a5b83..eec0d0d 100644
+--- a/timemaster.c
++++ b/timemaster.c
+@@ -623,7 +623,8 @@ static void add_shm_source(int shm_segment, int poll, int dpoll, double delay,
+ 		break;
+ 	case NTPD:
+ 		string_appendf(ntp_config,
+-			       "server 127.127.28.%d minpoll %d maxpoll %d\n"
++			       "server 127.127.28.%d minpoll %d maxpoll %d "
++			       "mode 1\n"
+ 			       "fudge 127.127.28.%d refid %s\n",
+ 			       shm_segment, poll, poll, shm_segment, refid);
+ 		break;

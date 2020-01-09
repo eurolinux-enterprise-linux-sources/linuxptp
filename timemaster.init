@@ -1,16 +1,16 @@
 #!/bin/bash
-# Start/stop ptp4l
-# chkconfig:   - 60 40
-# description: Precision Time Protocol (PTP) service.
+# Start/stop timemaster
+# chkconfig:   - 61 39
+# description: Synchronize system clock to NTP and PTP time sources.
 
 ### BEGIN INIT INFO
-# Provides: ptp4l
+# Provides: timemaster
 # Required-Start: $network $local_fs $remote_fs
 # Required-Stop: 
 # Should-Start: $syslog
 # Should-Stop: $syslog
-# Short-Description: PTP service
-# Description: Precision Time Protocol (PTP) service.
+# Short-Description: Synchronize clock via NTP and PTP
+# Description: Synchronize system clock to NTP and PTP time sources.
 ### END INIT INFO
 
 # Source function library.
@@ -19,19 +19,25 @@
 # Source networking configuration.
 . /etc/sysconfig/network
 
-prog=ptp4l
-
-[ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
-
+prog=timemaster
+config=/etc/timemaster.conf
 lockfile=/var/lock/subsys/$prog
 pidfile=/var/run/$prog.pid
+conflicts="ntpd ptp4l phc2sys"
 
 start() {
     [ "$NETWORKING" = "no" ] && exit 1
     [ -f $config ] || exit 6
+
+    for s in $conflicts; do
+        status -p /var/run/$s.pid $s >/dev/null 2>&1 || continue
+        echo "Conflicting service $s is already running. Cannot start $prog."
+        exit 1
+    done
+
     echo -n $"Starting $prog: "
     daemon --check $prog --pidfile $pidfile "(nohup /bin/sh -c \
-        \"echo \\\$\\\$ > $pidfile; exec /usr/sbin/$prog $OPTIONS\" &> /dev/null &)"
+        \"echo \\\$\\\$ > $pidfile; exec /usr/sbin/$prog -f $config\" &> /dev/null &)"
     retval=$?
     echo
     [ $retval -eq 0 ] && touch $lockfile

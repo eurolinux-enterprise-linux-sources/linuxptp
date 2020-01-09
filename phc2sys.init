@@ -21,11 +21,13 @@ prog=phc2sys
 [ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
 
 lockfile=/var/lock/subsys/$prog
+pidfile=/var/run/$prog.pid
 
 start() {
     [ -f $config ] || exit 6
     echo -n $"Starting $prog: "
-    daemon --check $prog "(nohup /usr/sbin/phc2sys $OPTIONS &> /dev/null &)"
+    daemon --check $prog --pidfile $pidfile "(nohup /bin/sh -c \
+        \"echo \\\$\\\$ > $pidfile; exec /usr/sbin/$prog $OPTIONS\" &> /dev/null &)"
     retval=$?
     echo
     [ $retval -eq 0 ] && touch $lockfile
@@ -34,7 +36,7 @@ start() {
 
 stop() {
     echo -n $"Stopping $prog: "
-    killproc $prog
+    killproc -p $pidfile $prog
     retval=$?
     echo
     [ $retval -eq 0 ] && rm -f $lockfile
@@ -55,7 +57,7 @@ force_reload() {
 }
 
 rh_status() {
-    status $prog
+    status -p $pidfile $prog
 }
 
 rh_status_q() {
