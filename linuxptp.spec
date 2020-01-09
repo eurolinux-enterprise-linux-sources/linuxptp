@@ -1,8 +1,6 @@
-%global gitdate 20121114
-%global gitrev e6bbbb
 Name:		linuxptp
-Version:	0
-Release:	0.6.%{gitdate}git%{gitrev}%{?dist}
+Version:	1.3
+Release:	1%{?dist}
 Summary:	PTP implementation for Linux
 ExclusiveArch:	%{ix86} x86_64
 
@@ -10,16 +8,14 @@ Group:		System Environment/Base
 License:	GPLv2+
 URL:		http://linuxptp.sourceforge.net/
 
-# git clone git://git.code.sf.net/p/linuxptp/code linuxptp; cd linuxptp
-# git archive --prefix=linuxptp/ %{gitrev} | gzip > linuxptp-%{gitdate}git%{gitrev}.tar.gz
-Source0:	%{name}-%{gitdate}git%{gitrev}.tar.gz
+Source0:	http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tgz
 Source1:	phc2sys.init
 Source2:	ptp4l.init
 
-BuildRequires:	kernel-headers > 2.6.32-322
+BuildRequires:	kernel-headers > 2.6.32-382
 
-Requires(post): chkconfig info
-Requires(preun): chkconfig initscripts info
+Requires(post): chkconfig
+Requires(preun): chkconfig initscripts
 Requires(postun): initscripts
 
 %description
@@ -30,7 +26,7 @@ Application Programming Interfaces (API) offered by the Linux kernel.
 Supporting legacy APIs and other platforms is not a goal.
 
 %prep
-%setup -q -n %{name}
+%setup -q
 
 %build
 make %{?_smp_mflags} \
@@ -39,13 +35,17 @@ make %{?_smp_mflags} \
 
 %install
 %makeinstall
-mkdir -p $RPM_BUILD_ROOT{%{_sysconfdir}/sysconfig,%{_initrddir}}
+
+mkdir -p $RPM_BUILD_ROOT{%{_sysconfdir}/sysconfig,%{_initrddir},%{_mandir}/man5}
 install -m 644 -p default.cfg $RPM_BUILD_ROOT%{_sysconfdir}/ptp4l.conf
 install -m 755 -p %{SOURCE1} $RPM_BUILD_ROOT%{_initrddir}/phc2sys
 install -m 755 -p %{SOURCE2} $RPM_BUILD_ROOT%{_initrddir}/ptp4l
+
 echo 'OPTIONS="-f /etc/ptp4l.conf -i eth0"' > \
 	$RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/ptp4l
-echo 'OPTIONS="-d /dev/pps0"' > $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/phc2sys
+echo 'OPTIONS="-w -s eth0"' > $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/phc2sys
+
+echo '.so man8/ptp4l.8' > $RPM_BUILD_ROOT%{_mandir}/man5/ptp4l.conf.5
 
 %post
 /sbin/chkconfig --add ptp4l
@@ -79,9 +79,27 @@ fi
 %{_sbindir}/phc2sys
 %{_sbindir}/pmc
 %{_sbindir}/ptp4l
+%{_mandir}/man5/*.5*
 %{_mandir}/man8/*.8*
 
 %changelog
+* Mon Aug 05 2013 Miroslav Lichvar <mlichvar@redhat.com> 1.3-1
+- update to 1.3 (#991332, #916787)
+
+* Tue Jul 30 2013 Miroslav Lichvar <mlichvar@redhat.com> 1.2-3.20130730git7789f0
+- update to 20130730git7789f0 (#916787)
+
+* Fri Jul 19 2013 Miroslav Lichvar <mlichvar@redhat.com> 1.2-2.20130719git48f4dc
+- update to 20130719git48f4dc (#916787, #985531)
+- add man page link for ptp4l.conf
+- update kernel-headers build requirement
+- change default phc2sys options to use -s
+
+* Wed Jun 26 2013 Miroslav Lichvar <mlichvar@redhat.com> 1.2-1.20130625gitfa41be
+- update to 20130625gitfa41be
+  (#916787, #977258, #910966, #910974, #924041, #966787)
+- improve initial frequency estimation
+
 * Thu Nov 22 2012 Miroslav Lichvar <mlichvar@redhat.com> 0-0.6.20121114gite6bbbb
 - update to 20121114gite6bbbb
 - add versioned build requirement on kernel-headers
