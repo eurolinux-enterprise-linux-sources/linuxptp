@@ -1,18 +1,28 @@
+%global gitdate	20140318
+%global gitrev	2b099c
 Name:		linuxptp
-Version:	1.3
-Release:	1%{?dist}
+Version:	1.4
+Release:	2.%{gitdate}git%{gitrev}%{?dist}
 Summary:	PTP implementation for Linux
-ExclusiveArch:	%{ix86} x86_64
+ExclusiveArch:	%{ix86} x86_64 ppc ppc64
 
 Group:		System Environment/Base
 License:	GPLv2+
 URL:		http://linuxptp.sourceforge.net/
 
-Source0:	http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tgz
+#Source0:      http://downloads.sourceforge.net/%{name}/%{name}-%{version}.tgz
+# git clone git://git.code.sf.net/p/linuxptp/code linuxptp; cd linuxptp
+# git archive --prefix=linuxptp-%{version}/ %{gitrev} | \
+# gzip > linuxptp-%{gitdate}git%{gitrev}.tar.gz
+Source0:	%{name}-%{gitdate}git%{gitrev}.tar.gz
 Source1:	phc2sys.init
 Source2:	ptp4l.init
+# test suite from https://github.com/mlichvar/linuxptp-testsuite.git
+Source3:	testsuite-76d0c2.tar.gz
+# simulator for test suite from https://github.com/mlichvar/clknetsim.git
+Source4:	clknetsim-8a7f9e.tar.gz
 
-BuildRequires:	kernel-headers > 2.6.32-382
+BuildRequires:	kernel-headers > 2.6.32-477
 
 Requires(post): chkconfig
 Requires(preun): chkconfig initscripts
@@ -26,12 +36,13 @@ Application Programming Interfaces (API) offered by the Linux kernel.
 Supporting legacy APIs and other platforms is not a goal.
 
 %prep
-%setup -q
+%setup -q -a 3 -a 4
+mv clknetsim testsuite
 
 %build
 make %{?_smp_mflags} \
-	EXTRA_CFLAGS="$RPM_OPT_FLAGS -pie -fpie" \
-	EXTRA_LDFLAGS="-Wl,-z,relro,-z,now"
+	EXTRA_CFLAGS="$RPM_OPT_FLAGS -fpie" \
+	EXTRA_LDFLAGS="-pie -Wl,-z,relro,-z,now"
 
 %install
 %makeinstall
@@ -46,6 +57,11 @@ echo 'OPTIONS="-f /etc/ptp4l.conf -i eth0"' > \
 echo 'OPTIONS="-w -s eth0"' > $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/phc2sys
 
 echo '.so man8/ptp4l.8' > $RPM_BUILD_ROOT%{_mandir}/man5/ptp4l.conf.5
+
+%check
+cd testsuite
+make %{?_smp_mflags} -C clknetsim
+PATH=..:$PATH ./run
 
 %post
 /sbin/chkconfig --add ptp4l
@@ -83,6 +99,14 @@ fi
 %{_mandir}/man8/*.8*
 
 %changelog
+* Tue Jun 10 2014 Miroslav Lichvar <mlichvar@redhat.com> 1.4-2.20140318git2b099c
+- build also on ppc and ppc64 (#1095400)
+
+* Wed May 28 2014 Miroslav Lichvar <mlichvar@redhat.com> 1.4-1.20140318git2b099c
+- update to 20140318git2b099c (#1067502, #1011022, #1019121, #1004996, #1016356)
+- fix PIE linking (#1094368)
+- include simulation test suite
+
 * Mon Aug 05 2013 Miroslav Lichvar <mlichvar@redhat.com> 1.3-1
 - update to 1.3 (#991332, #916787)
 
