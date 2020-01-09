@@ -1,0 +1,97 @@
+#!/bin/bash
+# Start/stop phc2sys
+# chkconfig:   - 70 30
+# description: Synchronize system clock or PTP hardware clock (PHC).
+
+### BEGIN INIT INFO
+# Provides: phc2sys
+# Required-Start: $local_fs $remote_fs
+# Required-Stop: 
+# Should-Start: $syslog
+# Should-Stop: $syslog
+# Short-Description: Synchronize two clocks
+# Description: Synchronize system clock or PTP hardware clock (PHC).
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+prog=phc2sys
+
+[ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
+
+lockfile=/var/lock/subsys/$prog
+
+start() {
+    [ -f $config ] || exit 6
+    echo -n $"Starting $prog: "
+    daemon --check $prog "(nohup /usr/sbin/phc2sys $OPTIONS &> /dev/null &)"
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && touch $lockfile
+    return $retval
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    killproc $prog
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && rm -f $lockfile
+    return $retval
+}
+
+restart() {
+    stop
+    start
+}
+
+reload() {
+    restart
+}
+
+force_reload() {
+    restart
+}
+
+rh_status() {
+    status $prog
+}
+
+rh_status_q() {
+    rh_status >/dev/null 2>&1
+}
+
+
+case "$1" in
+    start)
+        rh_status_q && exit 0
+        $1
+        ;;
+    stop)
+        rh_status_q || exit 0
+        $1
+        ;;
+    restart)
+        $1
+        ;;
+    reload)
+        rh_status_q || exit 7
+        $1
+        ;;
+    force-reload)
+        force_reload
+        ;;
+    status)
+        rh_status
+        ;;
+    condrestart|try-restart)
+        rh_status_q || exit 0
+        restart
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload}"
+        exit 2
+esac
+exit $?
+
