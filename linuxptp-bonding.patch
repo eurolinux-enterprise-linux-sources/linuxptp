@@ -1,0 +1,1671 @@
+commit 17aa750a49ebaecfc7b063c770aa8d36f5078b2c
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Jul 10 15:39:28 2017 +0800
+
+    rtnl: replace obsolete RTMGRP_LINK with RTNLGRP_LINK for nl groups
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/rtnl.c b/rtnl.c
+index 5cddc4b..d7a430d 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -151,7 +151,7 @@ int rtnl_open(void)
+ 
+ 	memset(&sa, 0, sizeof(sa));
+ 	sa.nl_family = AF_NETLINK;
+-	sa.nl_groups = RTMGRP_LINK;
++	sa.nl_groups = RTNLGRP_LINK;
+ 
+ 	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+ 	if (fd < 0) {
+commit c149a3dbc1b38e833de783ae863038562baca0fe
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Jul 10 15:39:29 2017 +0800
+
+    port: add FD_RTNL event to track per-port status
+    
+    With rtnl socket we can track link status per port(except UDS port).
+    
+    We can make sure we get the correct interface and latest status with function
+    port_link_status().
+    
+    At the same time we need to set clock sde after link down. But we return
+    EV_FAULT_DETECTED in port_event(), which will not set clock sde. So we need
+    to set it in port_link_status().
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index b6afba9..4c5c4e3 100644
+--- a/clock.c
++++ b/clock.c
+@@ -1469,6 +1469,11 @@ struct PortIdentity clock_parent_identity(struct clock *c)
+ 	return c->dad.pds.parentPortIdentity;
+ }
+ 
++void clock_set_sde(struct clock *c, int sde)
++{
++	c->sde = sde;
++}
++
+ int clock_poll(struct clock *c)
+ {
+ 	int cnt, i;
+diff --git a/clock.h b/clock.h
+index fcd9328..49ecb76 100644
+--- a/clock.h
++++ b/clock.h
+@@ -205,6 +205,13 @@ void clock_peer_delay(struct clock *c, tmv_t ppd, tmv_t req, tmv_t rx,
+ 		      double nrr);
+ 
+ /**
++ * Set clock sde
++ * @param c     A pointer to a clock instance obtained with clock_create().
++ * @param sde   Pass one (1) if need a decision event and zero if not.
++ */
++void clock_set_sde(struct clock *c, int sde);
++
++/**
+  * Poll for events and dispatch them.
+  * @param c A pointer to a clock instance obtained with clock_create().
+  * @return  Zero on success, non-zero otherwise.
+diff --git a/fd.h b/fd.h
+index e328e98..23401f4 100644
+--- a/fd.h
++++ b/fd.h
+@@ -31,6 +31,7 @@ enum {
+ 	FD_QUALIFICATION_TIMER,
+ 	FD_MANNO_TIMER,
+ 	FD_SYNC_TX_TIMER,
++	FD_RTNL,
+ 	N_POLLFD,
+ };
+ 
+diff --git a/port.c b/port.c
+index ec02825..2896d1a 100644
+--- a/port.c
++++ b/port.c
+@@ -23,6 +23,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/queue.h>
++#include <net/if.h>
+ 
+ #include "bmc.h"
+ #include "clock.h"
+@@ -32,6 +33,7 @@
+ #include "phc.h"
+ #include "port.h"
+ #include "print.h"
++#include "rtnl.h"
+ #include "sk.h"
+ #include "tlv.h"
+ #include "tmv.h"
+@@ -1458,7 +1460,9 @@ static void port_disable(struct port *p)
+ 	for (i = 0; i < N_TIMER_FDS; i++) {
+ 		close(p->fda.fd[FD_ANNOUNCE_TIMER + i]);
+ 	}
+-	port_clear_fda(p, N_POLLFD);
++
++	/* Keep rtnl socket to get link status info. */
++	port_clear_fda(p, FD_RTNL);
+ 	clock_fda_changed(p->clock);
+ }
+ 
+@@ -1502,6 +1506,14 @@ static int port_initialize(struct port *p)
+ 	if (port_set_announce_tmo(p))
+ 		goto no_tmo;
+ 
++	/* No need to open rtnl socket on UDS port. */
++	if (transport_type(p->trp) != TRANS_UDS) {
++		if (p->fda.fd[FD_RTNL] == -1)
++			p->fda.fd[FD_RTNL] = rtnl_open();
++		if (p->fda.fd[FD_RTNL] >= 0)
++			rtnl_link_query(p->fda.fd[FD_RTNL]);
++	}
++
+ 	port_nrate_initialize(p);
+ 
+ 	clock_fda_changed(p->clock);
+@@ -2025,6 +2037,10 @@ void port_close(struct port *p)
+ 	if (port_is_enabled(p)) {
+ 		port_disable(p);
+ 	}
++
++	if (p->fda.fd[FD_RTNL] >= 0)
++		rtnl_close(p->fda.fd[FD_RTNL]);
++
+ 	transport_destroy(p->trp);
+ 	tsproc_destroy(p->tsproc);
+ 	if (p->fault_fd >= 0)
+@@ -2204,6 +2220,24 @@ void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	}
+ }
+ 
++static void port_link_status(void *ctx, int index, int linkup)
++{
++	struct port *p = ctx;
++
++	if (index != if_nametoindex(p->name) || p->link_status == linkup)
++		return;
++
++	p->link_status = linkup;
++	pr_notice("port %hu: link %s", portnum(p), linkup ? "up" : "down");
++
++	/*
++	 * A port going down can affect the BMCA result.
++	 * Force a state decision event.
++	 */
++	if (!p->link_status)
++		clock_set_sde(p->clock, 1);
++}
++
+ enum fsm_event port_event(struct port *p, int fd_index)
+ {
+ 	enum fsm_event event = EV_NONE;
+@@ -2242,6 +2276,11 @@ enum fsm_event port_event(struct port *p, int fd_index)
+ 		pr_debug("port %hu: master sync timeout", portnum(p));
+ 		port_set_sync_tx_tmo(p);
+ 		return port_tx_sync(p) ? EV_FAULT_DETECTED : EV_NONE;
++
++	case FD_RTNL:
++		pr_debug("port %hu: received link status notification", portnum(p));
++		rtnl_link_status(fd, port_link_status, p);
++		return port_link_status_get(p) ? EV_FAULT_CLEARED : EV_FAULT_DETECTED;
+ 	}
+ 
+ 	msg = msg_allocate();
+commit 25ec8a3b4e2222b394794ff830bd3583e9cf6c71
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Jul 10 15:39:30 2017 +0800
+
+    clock: remove rtnl fd on clock
+    
+    Remove rtnl fd on clock since we track the link status per port now.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index 4c5c4e3..354f038 100644
+--- a/clock.c
++++ b/clock.c
+@@ -39,7 +39,6 @@
+ #include "servo.h"
+ #include "stats.h"
+ #include "print.h"
+-#include "rtnl.h"
+ #include "sk.h"
+ #include "tlv.h"
+ #include "tsproc.h"
+@@ -274,9 +273,6 @@ void clock_destroy(struct clock *c)
+ 	LIST_FOREACH_SAFE(p, &c->ports, list, tmp) {
+ 		clock_remove_port(c, p);
+ 	}
+-	if (c->pollfd[0].fd >= 0) {
+-		rtnl_close(c->pollfd[0].fd);
+-	}
+ 	port_close(c->uds_port);
+ 	free(c->pollfd);
+ 	hash_destroy(c->index2port, NULL);
+@@ -326,30 +322,6 @@ static void clock_freq_est_reset(struct clock *c)
+ 	c->fest.count = 0;
+ }
+ 
+-static void clock_link_status(void *ctx, int index, int linkup)
+-{
+-	struct clock *c = ctx;
+-	struct port *p;
+-	char key[16];
+-
+-	snprintf(key, sizeof(key), "%d", index);
+-	p = hash_lookup(c->index2port, key);
+-	if (!p) {
+-		return;
+-	}
+-	port_link_status_set(p, linkup);
+-	if (linkup) {
+-		port_dispatch(p, EV_FAULT_CLEARED, 0);
+-	} else {
+-		port_dispatch(p, EV_FAULT_DETECTED, 0);
+-		/*
+-		 * A port going down can affect the BMCA result.
+-		 * Force a state decision event.
+-		 */
+-		c->sde = 1;
+-	}
+-}
+-
+ static void clock_management_send_error(struct port *p,
+ 					struct ptp_message *msg, int error_id)
+ {
+@@ -1133,10 +1105,6 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 		return NULL;
+ 	}
+ 
+-	/* Open a RT netlink socket. */
+-	c->pollfd[0].fd = rtnl_open();
+-	c->pollfd[0].events = POLLIN|POLLPRI;
+-
+ 	/* Create the UDS interface. */
+ 	c->uds_port = port_open(phc_index, timestamping, 0, udsif, c);
+ 	if (!c->uds_port) {
+@@ -1164,9 +1132,7 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 		port_dispatch(p, EV_INITIALIZE, 0);
+ 	}
+ 	port_dispatch(c->uds_port, EV_INITIALIZE, 0);
+-	if (c->pollfd[0].fd >= 0) {
+-		rtnl_link_query(c->pollfd[0].fd);
+-	}
++
+ 	return c;
+ }
+ 
+@@ -1231,12 +1197,9 @@ static int clock_resize_pollfd(struct clock *c, int new_nports)
+ {
+ 	struct pollfd *new_pollfd;
+ 
+-	/*
+-	 * Need to allocate one descriptor for RT netlink and one
+-	 * whole extra block of fds for UDS.
+-	 */
++	/* Need to allocate one whole extra block of fds for UDS. */
+ 	new_pollfd = realloc(c->pollfd,
+-			     (1 + (new_nports + 1) * N_CLOCK_PFD) *
++			     (new_nports + 1) * N_CLOCK_PFD *
+ 			     sizeof(struct pollfd));
+ 	if (!new_pollfd)
+ 		return -1;
+@@ -1261,7 +1224,7 @@ static void clock_fill_pollfd(struct pollfd *dest, struct port *p)
+ static void clock_check_pollfd(struct clock *c)
+ {
+ 	struct port *p;
+-	struct pollfd *dest = c->pollfd + 1;
++	struct pollfd *dest = c->pollfd;
+ 
+ 	if (c->pollfd_valid)
+ 		return;
+@@ -1482,7 +1445,7 @@ int clock_poll(struct clock *c)
+ 	struct port *p;
+ 
+ 	clock_check_pollfd(c);
+-	cnt = poll(c->pollfd, 1 + (c->nports + 1) * N_CLOCK_PFD, -1);
++	cnt = poll(c->pollfd, (c->nports + 1) * N_CLOCK_PFD, -1);
+ 	if (cnt < 0) {
+ 		if (EINTR == errno) {
+ 			return 0;
+@@ -1494,13 +1457,8 @@ int clock_poll(struct clock *c)
+ 		return 0;
+ 	}
+ 
+-	/* Check the RT netlink. */
+ 	cur = c->pollfd;
+-	if (cur->revents & (POLLIN|POLLPRI)) {
+-		rtnl_link_status(cur->fd, clock_link_status, c);
+-	}
+ 
+-	cur++;
+ 	LIST_FOREACH(p, &c->ports, list) {
+ 		/* Let the ports handle their events. */
+ 		for (i = 0; i < N_POLLFD; i++) {
+diff --git a/port.c b/port.c
+index 2896d1a..34837cc 100644
+--- a/port.c
++++ b/port.c
+@@ -2411,12 +2411,6 @@ int port_link_status_get(struct port *p)
+ 	return p->link_status;
+ }
+ 
+-void port_link_status_set(struct port *p, int up)
+-{
+-	p->link_status = up ? 1 : 0;
+-	pr_notice("port %hu: link %s", portnum(p), up ? "up" : "down");
+-}
+-
+ int port_manage(struct port *p, struct port *ingress, struct ptp_message *msg)
+ {
+ 	struct management_tlv *mgt;
+diff --git a/port.h b/port.h
+index b00bc64..60fd0a4 100644
+--- a/port.h
++++ b/port.h
+@@ -132,13 +132,6 @@ int port_number(struct port *p);
+ int port_link_status_get(struct port *p);
+ 
+ /**
+- * Sets the link status for a port.
+- * @param p        A port instance.
+- * @param up       Pass one (1) if the link is up and zero if down.
+- */
+-void port_link_status_set(struct port *p, int up);
+-
+-/**
+  * Manage a port according to a given message.
+  * @param p        A pointer previously obtained via port_open().
+  * @param ingress  The port on which 'msg' was received.
+commit 7c3f9579f0c230ee798644a26d664ebd3efc612f
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Jul 10 15:39:31 2017 +0800
+
+    clock: remove hash table index2port
+    
+    Remove index2port since we don't need it now.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index 354f038..da15882 100644
+--- a/clock.c
++++ b/clock.c
+@@ -31,7 +31,6 @@
+ #include "clockcheck.h"
+ #include "foreign.h"
+ #include "filter.h"
+-#include "hash.h"
+ #include "missing.h"
+ #include "msg.h"
+ #include "phc.h"
+@@ -39,7 +38,6 @@
+ #include "servo.h"
+ #include "stats.h"
+ #include "print.h"
+-#include "sk.h"
+ #include "tlv.h"
+ #include "tsproc.h"
+ #include "uds.h"
+@@ -96,7 +94,6 @@ struct clock {
+ 	int nports; /* does not include the UDS port */
+ 	int last_port_number;
+ 	int sde;
+-	struct hash *index2port;
+ 	int free_running;
+ 	int freq_est_interval;
+ 	int grand_master_capable; /* for 802.1AS only */
+@@ -275,7 +272,6 @@ void clock_destroy(struct clock *c)
+ 	}
+ 	port_close(c->uds_port);
+ 	free(c->pollfd);
+-	hash_destroy(c->index2port, NULL);
+ 	if (c->clkid != CLOCK_REALTIME) {
+ 		phc_close(c->clkid);
+ 	}
+@@ -773,8 +769,6 @@ static int clock_add_port(struct clock *c, int phc_index,
+ 			  struct interface *iface)
+ {
+ 	struct port *p, *piter, *lastp = NULL;
+-	int fd, index;
+-	char key[16];
+ 
+ 	if (clock_resize_pollfd(c, c->nports + 1)) {
+ 		return -1;
+@@ -795,24 +789,6 @@ static int clock_add_port(struct clock *c, int phc_index,
+ 	c->nports++;
+ 	clock_fda_changed(c);
+ 
+-	/* Remember the index to port mapping, for link status tracking. */
+-	fd = sk_interface_fd();
+-	if (fd < 0) {
+-		return -1;
+-	}
+-	index = sk_interface_index(fd, iface->name);
+-	if (index < 0) {
+-		close(fd);
+-		return -1;
+-	}
+-	snprintf(key, sizeof(key), "%d", index);
+-	if (hash_insert(c->index2port, key, p)) {
+-		pr_err("failed to add port with index %d twice!", index);
+-		close(fd);
+-		return -1;
+-	}
+-	close(fd);
+-
+ 	return 0;
+ }
+ 
+@@ -1113,11 +1089,6 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 	}
+ 	clock_fda_changed(c);
+ 
+-	c->index2port = hash_create();
+-	if (!c->index2port) {
+-		pr_err("failed create index-to-port hash table");
+-		return NULL;
+-	}
+ 	/* Create the ports. */
+ 	STAILQ_FOREACH(iface, &config->interfaces, list) {
+ 		if (clock_add_port(c, phc_index, timestamping, iface)) {
+commit 9e744d9e8a2dab6ec0ea5ece5ac25e7384264575
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:39 2017 +0800
+
+    config: add new element ts_label in struct interface
+    
+    Add new element ts_label in struct interface to track real ts interface.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/config.h b/config.h
+index 1cc7051..c79855e 100644
+--- a/config.h
++++ b/config.h
+@@ -36,6 +36,7 @@
+ struct interface {
+ 	STAILQ_ENTRY(interface) list;
+ 	char name[MAX_IFNAME_SIZE + 1];
++	char ts_label[MAX_IFNAME_SIZE + 1];
+ 	struct sk_ts_info ts_info;
+ };
+ 
+commit 7e294a4d047654f746c3fcdff7bce512be149e37
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:40 2017 +0800
+
+    port: track interface info in port
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index 34837cc..849a7c1 100644
+--- a/port.c
++++ b/port.c
+@@ -68,6 +68,7 @@ struct nrate_estimator {
+ struct port {
+ 	LIST_ENTRY(port) list;
+ 	char *name;
++	struct interface *iface;
+ 	struct clock *clock;
+ 	struct transport *trp;
+ 	enum timestamp_type timestamping;
+@@ -2619,6 +2620,7 @@ struct port *port_open(int phc_index,
+ 	}
+ 
+ 	p->name = interface->name;
++	p->iface = interface;
+ 	p->asymmetry = config_get_int(cfg, p->name, "delayAsymmetry");
+ 	p->asymmetry <<= 16;
+ 	p->announce_span = transport == TRANS_UDS ? 0 : ANNOUNCE_SPAN;
+commit 05bba46198cfc4ccfe0aff2e67e76d78898bbd96
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:41 2017 +0800
+
+    rtnl: update rtgenmsg to ifinfomsg when request link info
+    
+    The previous function use general message and will dump all interfaces'
+    information. Now update with ifinfomsg so we could get specific interface's
+    information.
+    
+    We still could get all interfaces' info if set device to NULL.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index 849a7c1..5b85d87 100644
+--- a/port.c
++++ b/port.c
+@@ -1512,7 +1512,7 @@ static int port_initialize(struct port *p)
+ 		if (p->fda.fd[FD_RTNL] == -1)
+ 			p->fda.fd[FD_RTNL] = rtnl_open();
+ 		if (p->fda.fd[FD_RTNL] >= 0)
+-			rtnl_link_query(p->fda.fd[FD_RTNL]);
++			rtnl_link_query(p->fda.fd[FD_RTNL], p->iface->name);
+ 	}
+ 
+ 	port_nrate_initialize(p);
+diff --git a/rtnl.c b/rtnl.c
+index d7a430d..8ecf6fe 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -42,7 +42,7 @@ int rtnl_close(int fd)
+ 	return close(fd);
+ }
+ 
+-int rtnl_link_query(int fd)
++int rtnl_link_query(int fd, char *device)
+ {
+ 	struct sockaddr_nl sa;
+ 	struct msghdr msg;
+@@ -51,19 +51,21 @@ int rtnl_link_query(int fd)
+ 
+ 	struct {
+ 		struct nlmsghdr hdr;
+-		struct rtgenmsg gen;
++		struct ifinfomsg ifm;
+ 	} __attribute__((packed)) request;
+ 
+ 	memset(&sa, 0, sizeof(sa));
+ 	sa.nl_family = AF_NETLINK;
+ 
+ 	memset(&request, 0, sizeof(request));
+-	request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(request.gen));
++	request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(request.ifm));
+ 	request.hdr.nlmsg_type = RTM_GETLINK;
+-	request.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++	request.hdr.nlmsg_flags = NLM_F_REQUEST;
+ 	request.hdr.nlmsg_seq = 1;
+ 	request.hdr.nlmsg_pid = 0;
+-	request.gen.rtgen_family = AF_UNSPEC;
++	request.ifm.ifi_family = AF_UNSPEC;
++	request.ifm.ifi_index = if_nametoindex(device ? device : "");
++	request.ifm.ifi_change = 0xffffffff;
+ 
+ 	iov.iov_base = &request;
+ 	iov.iov_len = sizeof(request);
+diff --git a/rtnl.h b/rtnl.h
+index f1871f2..5c93eec 100644
+--- a/rtnl.h
++++ b/rtnl.h
+@@ -31,10 +31,11 @@ int rtnl_close(int fd);
+ 
+ /**
+  * Request the link status from the kernel.
+- * @param fd  A socket obtained via rtnl_open().
+- * @return    Zero on success, non-zero otherwise.
++ * @param fd     A socket obtained via rtnl_open().
++ * @param device Interface name. Request all iface's status if set NULL.
++ * @return       Zero on success, non-zero otherwise.
+  */
+-int rtnl_link_query(int fd);
++int rtnl_link_query(int fd, char *device);
+ 
+ /**
+  * Read kernel messages looking for a link up/down events.
+Backport of commit 80bc4d4c2f4d1c3c246091aa6f103bb7943202ec
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:42 2017 +0800
+
+    rtnl: update function rtnl_link_status to get bond slave info
+    
+    Update function rtnl_link_status to get bond slave info. Pass the slave index
+    to call back functions. i.e. port_link_status.
+    
+    Also check the interface index of rtnl message in function rtnl_link_status.
+    Then we don't need to check it in port_link_status.
+    
+    [BACKPORT: not included] Add ifndef IFLA_BOND_MAX in case we build linuxptp
+    on kernel before v3.13-rc1.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index 5b85d87..05fc321 100644
+--- a/port.c
++++ b/port.c
+@@ -2221,11 +2221,11 @@ void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	}
+ }
+ 
+-static void port_link_status(void *ctx, int index, int linkup)
++static void port_link_status(void *ctx, int linkup, int ts_index)
+ {
+ 	struct port *p = ctx;
+ 
+-	if (index != if_nametoindex(p->name) || p->link_status == linkup)
++	if (p->link_status == linkup)
+ 		return;
+ 
+ 	p->link_status = linkup;
+@@ -2280,7 +2280,7 @@ enum fsm_event port_event(struct port *p, int fd_index)
+ 
+ 	case FD_RTNL:
+ 		pr_debug("port %hu: received link status notification", portnum(p));
+-		rtnl_link_status(fd, port_link_status, p);
++		rtnl_link_status(fd, p->name, port_link_status, p);
+ 		return port_link_status_get(p) ? EV_FAULT_CLEARED : EV_FAULT_DETECTED;
+ 	}
+ 
+diff --git a/rtnl.c b/rtnl.c
+index 8ecf6fe..3419873 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -84,15 +85,79 @@ int rtnl_link_query(int fd, char *device)
+ 	return 0;
+ }
+ 
+-int rtnl_link_status(int fd, rtnl_callback cb, void *ctx)
++static inline __u32 rta_getattr_u32(const struct rtattr *rta)
+ {
+-	int index, len;
++	return *(__u32 *)RTA_DATA(rta);
++}
++
++static inline const char *rta_getattr_str(const struct rtattr *rta)
++{
++	return (const char *)RTA_DATA(rta);
++}
++
++static int rtnl_rtattr_parse(struct rtattr *tb[], int max, struct rtattr *rta, int len)
++{
++	unsigned short type;
++
++	memset(tb, 0, sizeof(struct rtattr *) * max);
++	while (RTA_OK(rta, len)) {
++		type = rta->rta_type;
++		if ((type < max) && (!tb[type]))
++			tb[type] = rta;
++		rta = RTA_NEXT(rta, len);
++	}
++	if (len) {
++		pr_err("Length mismatch: len %d, rta_len=%d\n", len, rta->rta_len);
++		return -1;
++	}
++
++	return 0;
++}
++
++static inline int rtnl_nested_rtattr_parse(struct rtattr *tb[], int max, struct rtattr *rta)
++{
++	return rtnl_rtattr_parse(tb, max, RTA_DATA(rta), RTA_PAYLOAD(rta));
++}
++
++static int rtnl_linkinfo_parse(struct rtattr *rta)
++{
++	int index = -1;
++	const char *kind;
++	struct rtattr *linkinfo[IFLA_INFO_MAX];
++	struct rtattr *bond[IFLA_BOND_MAX];
++
++	if (rtnl_nested_rtattr_parse(linkinfo, IFLA_INFO_MAX, rta) < 0)
++		return -1;
++
++	if (linkinfo[IFLA_INFO_KIND]) {
++		kind = rta_getattr_str(linkinfo[IFLA_INFO_KIND]);
++
++		if (kind && !strncmp(kind, "bond", 4) &&
++		    linkinfo[IFLA_INFO_DATA]) {
++			if (rtnl_nested_rtattr_parse(bond, IFLA_BOND_MAX,
++						 linkinfo[IFLA_INFO_DATA]) < 0)
++				return -1;
++
++			if (bond[IFLA_BOND_ACTIVE_SLAVE]) {
++				index = rta_getattr_u32(bond[IFLA_BOND_ACTIVE_SLAVE]);
++			}
++		}
++	}
++	return index;
++}
++
++int rtnl_link_status(int fd, char *device, rtnl_callback cb, void *ctx)
++{
++	int index, len, link_up;
++	int slave_index = -1;
+ 	struct iovec iov;
+ 	struct sockaddr_nl sa;
+ 	struct msghdr msg;
+ 	struct nlmsghdr *nh;
+ 	struct ifinfomsg *info = NULL;
++	struct rtattr *tb[IFLA_MAX+1];
+ 
++	index = if_nametoindex(device);
+ 	if (!rtnl_buf) {
+ 		rtnl_len = 4096;
+ 		rtnl_buf = malloc(rtnl_len);
+@@ -135,14 +200,27 @@ int rtnl_link_status(int fd, rtnl_callback cb, void *ctx)
+ 	nh = (struct nlmsghdr *) rtnl_buf;
+ 
+ 	for ( ; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+-		if (nh->nlmsg_type == RTM_NEWLINK) {
+-			info = NLMSG_DATA(nh);
+-			index = info->ifi_index;
+-			pr_debug("interface index %d is %s", index,
+-				 info->ifi_flags & IFF_RUNNING ? "up" : "down");
+-			cb(ctx, index, info->ifi_flags & IFF_RUNNING ? 1 : 0);
+-		}
++		if (nh->nlmsg_type != RTM_NEWLINK)
++			continue;
++
++		info = NLMSG_DATA(nh);
++		if (index != info->ifi_index)
++			continue;
++
++		link_up = info->ifi_flags & IFF_RUNNING ? 1 : 0;
++		pr_debug("interface index %d is %s", index,
++			 link_up ? "up" : "down");
++
++		rtnl_rtattr_parse(tb, IFLA_MAX, IFLA_RTA(info),
++				  IFLA_PAYLOAD(nh));
++
++		if (tb[IFLA_LINKINFO])
++			slave_index = rtnl_linkinfo_parse(tb[IFLA_LINKINFO]);
++
++		if (cb)
++			cb(ctx, link_up, slave_index);
+ 	}
++
+ 	return 0;
+ }
+ 
+diff --git a/rtnl.h b/rtnl.h
+index 5c93eec..6eced2d 100644
+--- a/rtnl.h
++++ b/rtnl.h
+@@ -20,7 +20,7 @@
+ #ifndef HAVE_RTNL_H
+ #define HAVE_RTNL_H
+ 
+-typedef void (*rtnl_callback)(void *ctx, int index, int linkup);
++typedef void (*rtnl_callback)(void *ctx, int linkup, int ts_index);
+ 
+ /**
+  * Close a RT netlink socket.
+@@ -39,12 +39,13 @@ int rtnl_link_query(int fd, char *device);
+ 
+ /**
+  * Read kernel messages looking for a link up/down events.
+- * @param fd   Readable socket obtained via rtnl_open().
+- * @param cb   Callback function to be invoked on each event.
+- * @param ctx  Private context passed to the callback.
+- * @return     Zero on success, non-zero otherwise.
++ * @param fd     Readable socket obtained via rtnl_open().
++ * @param device The device which we need to get link info.
++ * @param cb     Callback function to be invoked on each event.
++ * @param ctx    Private context passed to the callback.
++ * @return       Zero on success, non-zero otherwise.
+  */
+-int rtnl_link_status(int fd, rtnl_callback cb, void *ctx);
++int rtnl_link_status(int fd, char *device, rtnl_callback cb, void *ctx);
+ 
+ /**
+  * Open a RT netlink socket for monitoring link state.
+commit 6d1e2a62bdb4f6353e3a9006f2d603031f4648e6
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:43 2017 +0800
+
+    rtnl: add function rtnl_get_ts_label to get interface ts_label info
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/rtnl.c b/rtnl.c
+index 3419873..cea936b 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -43,6 +43,37 @@ int rtnl_close(int fd)
+ 	return close(fd);
+ }
+ 
++static void rtnl_get_ts_label_callback(void *ctx, int linkup, int ts_index)
++{
++	int *dst = ctx;
++	*dst = ts_index;
++}
++
++int rtnl_get_ts_label(struct interface *iface)
++{
++	int err, fd;
++	int ts_index = -1;
++
++	fd = rtnl_open();
++	if (fd < 0)
++		return fd;
++
++	err = rtnl_link_query(fd, iface->name);
++	if (err) {
++		goto no_info;
++	}
++
++	rtnl_link_status(fd, iface->name, rtnl_get_ts_label_callback, &ts_index);
++	if (ts_index > 0 && if_indextoname(ts_index, iface->ts_label))
++		err = 0;
++	else
++		err = -1;
++
++no_info:
++	rtnl_close(fd);
++	return err;
++}
++
+ int rtnl_link_query(int fd, char *device)
+ {
+ 	struct sockaddr_nl sa;
+diff --git a/rtnl.h b/rtnl.h
+index 6eced2d..2906d74 100644
+--- a/rtnl.h
++++ b/rtnl.h
+@@ -20,6 +20,8 @@
+ #ifndef HAVE_RTNL_H
+ #define HAVE_RTNL_H
+ 
++#include "config.h"
++
+ typedef void (*rtnl_callback)(void *ctx, int linkup, int ts_index);
+ 
+ /**
+@@ -30,6 +32,13 @@ typedef void (*rtnl_callback)(void *ctx, int linkup, int ts_index);
+ int rtnl_close(int fd);
+ 
+ /**
++ * Get interface ts_label information
++ * @param iface  struct interface.
++ * @return       Zero on success, or -1 on error.
++ */
++int rtnl_get_ts_label(struct interface *iface);
++
++/**
+  * Request the link status from the kernel.
+  * @param fd     A socket obtained via rtnl_open().
+  * @param device Interface name. Request all iface's status if set NULL.
+commit b65b1d5f3b5d8e85e47e9cf19c2e5aa6dc2ebd77
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:44 2017 +0800
+
+    port: update port link_status to enum
+    
+    Besides link up and down, we may also receive other rtnl messages, like
+    bond slave changed info, which link state keeps the same.
+    
+    So we should return EV_FAULT_CLEARED only when both LINK_UP and
+    LINK_STATE_CHANGED.
+    
+    When the link state keep the same, we should return EV_NONE.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index 05fc321..81d52ff 100644
+--- a/port.c
++++ b/port.c
+@@ -56,6 +56,12 @@ enum syfu_event {
+ 	FUP_MATCH,
+ };
+ 
++enum link_state {
++	LINK_DOWN  = (1<<0),
++	LINK_UP  = (1<<1),
++	LINK_STATE_CHANGED = (1<<3),
++};
++
+ struct nrate_estimator {
+ 	double ratio;
+ 	tmv_t origin1;
+@@ -122,7 +128,7 @@ struct port {
+ 	int                 path_trace_enabled;
+ 	int                 rx_timestamp_offset;
+ 	int                 tx_timestamp_offset;
+-	int                 link_status;
++	enum link_state     link_status;
+ 	struct fault_interval flt_interval_pertype[FT_CNT];
+ 	enum fault_type     last_fault_type;
+ 	unsigned int        versionNumber; /*UInteger4*/
+@@ -2224,18 +2230,21 @@ void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ static void port_link_status(void *ctx, int linkup, int ts_index)
+ {
+ 	struct port *p = ctx;
++	int link_state;
+ 
+-	if (p->link_status == linkup)
+-		return;
+-
+-	p->link_status = linkup;
+-	pr_notice("port %hu: link %s", portnum(p), linkup ? "up" : "down");
++	link_state = linkup ? LINK_UP : LINK_DOWN;
++	if (p->link_status & link_state) {
++		p->link_status = link_state;
++	} else {
++		p->link_status = link_state | LINK_STATE_CHANGED;
++		pr_notice("port %hu: link %s", portnum(p), linkup ? "up" : "down");
++	}
+ 
+ 	/*
+ 	 * A port going down can affect the BMCA result.
+ 	 * Force a state decision event.
+ 	 */
+-	if (!p->link_status)
++	if (p->link_status & LINK_DOWN)
+ 		clock_set_sde(p->clock, 1);
+ }
+ 
+@@ -2281,7 +2290,12 @@ enum fsm_event port_event(struct port *p, int fd_index)
+ 	case FD_RTNL:
+ 		pr_debug("port %hu: received link status notification", portnum(p));
+ 		rtnl_link_status(fd, p->name, port_link_status, p);
+-		return port_link_status_get(p) ? EV_FAULT_CLEARED : EV_FAULT_DETECTED;
++		if (p->link_status == (LINK_UP | LINK_STATE_CHANGED))
++			return EV_FAULT_CLEARED;
++		else if (p->link_status == (LINK_DOWN | LINK_STATE_CHANGED))
++			return EV_FAULT_DETECTED;
++		else
++			return EV_NONE;
+ 	}
+ 
+ 	msg = msg_allocate();
+@@ -2409,7 +2423,7 @@ int port_number(struct port *p)
+ 
+ int port_link_status_get(struct port *p)
+ {
+-	return p->link_status;
++	return !!(p->link_status & LINK_UP);
+ }
+ 
+ int port_manage(struct port *p, struct port *ingress, struct ptp_message *msg)
+@@ -2630,7 +2644,7 @@ struct port *port_open(int phc_index,
+ 	p->path_trace_enabled = config_get_int(cfg, p->name, "path_trace_enabled");
+ 	p->rx_timestamp_offset = config_get_int(cfg, p->name, "ingressLatency");
+ 	p->tx_timestamp_offset = config_get_int(cfg, p->name, "egressLatency");
+-	p->link_status = 1;
++	p->link_status = LINK_UP;
+ 	p->clock = clock;
+ 	p->trp = transport_create(cfg, transport);
+ 	if (!p->trp)
+commit 1440f093847a79d0e80ea6b4bca011ddd87090d0
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:45 2017 +0800
+
+    clock: add clock_required_modes to obtain the required time stamping mode
+    
+    Separate required_modes setting from clock_create so we can obtain the
+    required time stamping flags from other place.
+    
+    Add enum timestamping in struct clock to store the time stamping mode.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index 9d224c9..5926a3c 100644
+--- a/clock.c
++++ b/clock.c
+@@ -105,6 +105,7 @@ struct clock {
+ 	int time_flags;  /* grand master role */
+ 	int time_source; /* grand master role */
+ 	enum servo_state servo_state;
++	enum timestamp_type timestamping;
+ 	tmv_t master_offset;
+ 	tmv_t path_delay;
+ 	tmv_t ingress_ts;
+@@ -803,6 +804,34 @@ static void clock_remove_port(struct clock *c, struct port *p)
+ 	port_close(p);
+ }
+ 
++int clock_required_modes(struct clock *c)
++{
++	int required_modes = 0;
++
++	switch (c->timestamping) {
++	case TS_SOFTWARE:
++		required_modes |= SOF_TIMESTAMPING_TX_SOFTWARE |
++			SOF_TIMESTAMPING_RX_SOFTWARE |
++			SOF_TIMESTAMPING_SOFTWARE;
++		break;
++	case TS_LEGACY_HW:
++		required_modes |= SOF_TIMESTAMPING_TX_HARDWARE |
++			SOF_TIMESTAMPING_RX_HARDWARE |
++			SOF_TIMESTAMPING_SYS_HARDWARE;
++		break;
++	case TS_HARDWARE:
++	case TS_ONESTEP:
++		required_modes |= SOF_TIMESTAMPING_TX_HARDWARE |
++			SOF_TIMESTAMPING_RX_HARDWARE |
++			SOF_TIMESTAMPING_RAW_HARDWARE;
++		break;
++	default:
++		break;
++	}
++
++	return required_modes;
++}
++
+ struct clock *clock_create(enum clock_type type, struct config *config,
+ 			   const char *phc_device)
+ {
+@@ -911,24 +940,8 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 	}
+ 
+ 	/* Check the time stamping mode on each interface. */
+-	switch (timestamping) {
+-	case TS_SOFTWARE:
+-		required_modes |= SOF_TIMESTAMPING_TX_SOFTWARE |
+-			SOF_TIMESTAMPING_RX_SOFTWARE |
+-			SOF_TIMESTAMPING_SOFTWARE;
+-		break;
+-	case TS_LEGACY_HW:
+-		required_modes |= SOF_TIMESTAMPING_TX_HARDWARE |
+-			SOF_TIMESTAMPING_RX_HARDWARE |
+-			SOF_TIMESTAMPING_SYS_HARDWARE;
+-		break;
+-	case TS_HARDWARE:
+-	case TS_ONESTEP:
+-		required_modes |= SOF_TIMESTAMPING_TX_HARDWARE |
+-			SOF_TIMESTAMPING_RX_HARDWARE |
+-			SOF_TIMESTAMPING_RAW_HARDWARE;
+-		break;
+-	}
++	c->timestamping = timestamping;
++	required_modes = clock_required_modes(c);
+ 	STAILQ_FOREACH(iface, &config->interfaces, list) {
+ 		if (iface->ts_info.valid &&
+ 		    ((iface->ts_info.so_timestamping & required_modes) != required_modes)) {
+diff --git a/clock.h b/clock.h
+index 49ecb76..986d363 100644
+--- a/clock.h
++++ b/clock.h
+@@ -73,6 +73,14 @@ UInteger8 clock_class(struct clock *c);
+ struct config *clock_config(struct clock *c);
+ 
+ /**
++ * Obtains the required time stamping mode.
++ * @param c  The clock instance.
++ * @return   The value of required time stamping mode, which is a bit mask
++ *           of SOF_TIMESTAMPING_ flags.
++ */
++int clock_required_modes(struct clock *c);
++
++/**
+  * Create a clock instance. There can only be one clock in any system,
+  * so subsequent calls will destroy the previous clock instance.
+  *
+commit 536a71031d5c7689fd186ff550dc11cf743e02cb
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:46 2017 +0800
+
+    ptp4l: use ts label to get ts info
+    
+    Now the ts label will be either the bond active slave or the interface
+    name, which is the exactly interface we need to get ts info.
+    
+    When the link down/up or there is a fail over and ts_label changed, the
+    phc index may also changed. So we need to check get new ts info and check
+    clock_required_modes. We will set the link to LINK_DOWN by force if
+    the new ts_label's timestamp do not support required mode.
+    
+    If all good, then we set phc index to new one. Also sync clock interval
+    after switch phc.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index 5926a3c..41c8f81 100644
+--- a/clock.c
++++ b/clock.c
+@@ -38,6 +38,7 @@
+ #include "servo.h"
+ #include "stats.h"
+ #include "print.h"
++#include "rtnl.h"
+ #include "tlv.h"
+ #include "tsproc.h"
+ #include "uds.h"
+@@ -832,6 +833,16 @@ int clock_required_modes(struct clock *c)
+ 	return required_modes;
+ }
+ 
++/*
++ * If we do not have a slave or the rtnl query failed, then use our
++ * own interface name as the time stamping interface name.
++ */
++static void ensure_ts_label(struct interface *iface)
++{
++	if (iface->ts_label[0] == '\0')
++		strncpy(iface->ts_label, iface->name, MAX_IFNAME_SIZE);
++}
++
+ struct clock *clock_create(enum clock_type type, struct config *config,
+ 			   const char *phc_device)
+ {
+@@ -943,6 +954,9 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 	c->timestamping = timestamping;
+ 	required_modes = clock_required_modes(c);
+ 	STAILQ_FOREACH(iface, &config->interfaces, list) {
++		rtnl_get_ts_label(iface);
++		ensure_ts_label(iface);
++		sk_get_ts_info(iface->ts_label, &iface->ts_info);
+ 		if (iface->ts_info.valid &&
+ 		    ((iface->ts_info.so_timestamping & required_modes) != required_modes)) {
+ 			pr_err("interface '%s' does not support "
+diff --git a/config.c b/config.c
+index e6fe676..bbaf36e 100644
+--- a/config.c
++++ b/config.c
+@@ -633,7 +633,6 @@ struct interface *config_create_interface(char *name, struct config *cfg)
+ 	}
+ 
+ 	strncpy(iface->name, name, MAX_IFNAME_SIZE);
+-	sk_get_ts_info(iface->name, &iface->ts_info);
+ 	STAILQ_INSERT_TAIL(&cfg->interfaces, iface, list);
+ 	cfg->n_interfaces++;
+ 
+diff --git a/port.c b/port.c
+index 81d52ff..615c800 100644
+--- a/port.c
++++ b/port.c
+@@ -60,6 +60,7 @@ enum link_state {
+ 	LINK_DOWN  = (1<<0),
+ 	LINK_UP  = (1<<1),
+ 	LINK_STATE_CHANGED = (1<<3),
++	TS_LABEL_CHANGED  = (1<<4),
+ };
+ 
+ struct nrate_estimator {
+@@ -2231,6 +2232,8 @@ static void port_link_status(void *ctx, int linkup, int ts_index)
+ {
+ 	struct port *p = ctx;
+ 	int link_state;
++	char ts_label[MAX_IFNAME_SIZE + 1] = {0};
++	int required_modes;
+ 
+ 	link_state = linkup ? LINK_UP : LINK_DOWN;
+ 	if (p->link_status & link_state) {
+@@ -2240,6 +2243,39 @@ static void port_link_status(void *ctx, int linkup, int ts_index)
+ 		pr_notice("port %hu: link %s", portnum(p), linkup ? "up" : "down");
+ 	}
+ 
++	/* ts_label changed */
++	if (if_indextoname(ts_index, ts_label) && strcmp(p->iface->ts_label, ts_label)) {
++		strncpy(p->iface->ts_label, ts_label, MAX_IFNAME_SIZE);
++		p->link_status |= TS_LABEL_CHANGED;
++		pr_notice("port %hu: ts label changed to %s", portnum(p), ts_label);
++	}
++
++	/* Both link down/up and change ts_label may change phc index. */
++	if (p->link_status & LINK_UP &&
++	    (p->link_status & LINK_STATE_CHANGED || p->link_status & TS_LABEL_CHANGED)) {
++		sk_get_ts_info(p->iface->ts_label, &p->iface->ts_info);
++
++		/* Only switch phc with HW time stamping mode */
++		if (p->phc_index >= 0 && p->iface->ts_info.valid) {
++			required_modes = clock_required_modes(p->clock);
++			if ((p->iface->ts_info.so_timestamping & required_modes) != required_modes) {
++				pr_err("interface '%s' does not support requested "
++				       "timestamping mode, set link status down by force.",
++				       p->iface->ts_label);
++				p->link_status = LINK_DOWN | LINK_STATE_CHANGED;
++			} else if (p->phc_index != p->iface->ts_info.phc_index) {
++				p->phc_index = p->iface->ts_info.phc_index;
++
++				if (clock_switch_phc(p->clock, p->phc_index)) {
++					p->last_fault_type = FT_SWITCH_PHC;
++					port_dispatch(p, EV_FAULT_DETECTED, 0);
++					return;
++				}
++				clock_sync_interval(p->clock, p->log_sync_interval);
++			}
++		}
++	}
++
+ 	/*
+ 	 * A port going down can affect the BMCA result.
+ 	 * Force a state decision event.
+@@ -2292,7 +2328,8 @@ enum fsm_event port_event(struct port *p, int fd_index)
+ 		rtnl_link_status(fd, p->name, port_link_status, p);
+ 		if (p->link_status == (LINK_UP | LINK_STATE_CHANGED))
+ 			return EV_FAULT_CLEARED;
+-		else if (p->link_status == (LINK_DOWN | LINK_STATE_CHANGED))
++		else if ((p->link_status == (LINK_DOWN | LINK_STATE_CHANGED)) ||
++			 (p->link_status & TS_LABEL_CHANGED))
+ 			return EV_FAULT_DETECTED;
+ 		else
+ 			return EV_NONE;
+commit 8923bcdf64c0c95bac7af977b867393bae69e7a1
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:47 2017 +0800
+
+    transport: pass struct interface to transport_open
+    
+    Pass struct interface so we can use ts_iface in HW filter.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/pmc_common.c b/pmc_common.c
+index d92b0cd..447cf99 100644
+--- a/pmc_common.c
++++ b/pmc_common.c
+@@ -67,6 +67,7 @@ struct pmc *pmc_create(struct config *cfg, enum transport_type transport_type,
+ 		       int zero_datalen)
+ {
+ 	struct pmc *pmc;
++	struct interface iface;
+ 
+ 	pmc = calloc(1, sizeof *pmc);
+ 	if (!pmc)
+@@ -90,7 +91,9 @@ struct pmc *pmc_create(struct config *cfg, enum transport_type transport_type,
+ 		pr_err("failed to create transport");
+ 		goto failed;
+ 	}
+-	if (transport_open(pmc->transport, iface_name,
++
++	strncpy(iface.name, iface_name, MAX_IFNAME_SIZE);
++	if (transport_open(pmc->transport, &iface,
+ 			   &pmc->fdarray, TS_SOFTWARE)) {
+ 		pr_err("failed to open transport");
+ 		goto failed;
+diff --git a/port.c b/port.c
+index 615c800..1e3f474 100644
+--- a/port.c
++++ b/port.c
+@@ -1504,7 +1504,7 @@ static int port_initialize(struct port *p)
+ 			goto no_timers;
+ 		}
+ 	}
+-	if (transport_open(p->trp, p->name, &p->fda, p->timestamping))
++	if (transport_open(p->trp, p->iface, &p->fda, p->timestamping))
+ 		goto no_tropen;
+ 
+ 	for (i = 0; i < N_TIMER_FDS; i++) {
+@@ -1547,7 +1547,7 @@ static int port_renew_transport(struct port *p)
+ 	}
+ 	transport_close(p->trp, &p->fda);
+ 	port_clear_fda(p, FD_ANNOUNCE_TIMER);
+-	res = transport_open(p->trp, p->name, &p->fda, p->timestamping);
++	res = transport_open(p->trp, p->iface, &p->fda, p->timestamping);
+ 	/* Need to call clock_fda_changed even if transport_open failed in
+ 	 * order to update clock to the now closed descriptors. */
+ 	clock_fda_changed(p->clock);
+diff --git a/raw.c b/raw.c
+index 73e45b4..8b7bcf1 100644
+--- a/raw.c
++++ b/raw.c
+@@ -198,15 +198,16 @@ static void addr_to_mac(void *mac, struct address *addr)
+ 	memcpy(mac, &addr->sll.sll_addr, MAC_LEN);
+ }
+ 
+-static int raw_open(struct transport *t, const char *name,
++static int raw_open(struct transport *t, struct interface *iface,
+ 		    struct fdarray *fda, enum timestamp_type ts_type)
+ {
+ 	struct raw *raw = container_of(t, struct raw, t);
+ 	unsigned char ptp_dst_mac[MAC_LEN];
+ 	unsigned char p2p_dst_mac[MAC_LEN];
+ 	int efd, gfd;
+-	char *str;
++	char *str, *name;
+ 
++	name = iface->ts_label;
+ 	str = config_get_string(t->cfg, name, "ptp_dst_mac");
+ 	if (str2mac(str, ptp_dst_mac)) {
+ 		pr_err("invalid ptp_dst_mac %s", str);
+diff --git a/transport.c b/transport.c
+index d24c05b..3541394 100644
+--- a/transport.c
++++ b/transport.c
+@@ -31,10 +31,10 @@ int transport_close(struct transport *t, struct fdarray *fda)
+ 	return t->close(t, fda);
+ }
+ 
+-int transport_open(struct transport *t, const char *name,
++int transport_open(struct transport *t, struct interface *iface,
+ 		   struct fdarray *fda, enum timestamp_type tt)
+ {
+-	return t->open(t, name, fda, tt);
++	return t->open(t, iface, fda, tt);
+ }
+ 
+ int transport_recv(struct transport *t, int fd, struct ptp_message *msg)
+diff --git a/transport.h b/transport.h
+index 5d6ba98..15616bb 100644
+--- a/transport.h
++++ b/transport.h
+@@ -27,6 +27,7 @@
+ #include "msg.h"
+ 
+ struct config;
++struct interface;
+ 
+ /* Values from networkProtocol enumeration 7.4.1 Table 3 */
+ enum transport_type {
+@@ -54,7 +55,7 @@ struct transport;
+ 
+ int transport_close(struct transport *t, struct fdarray *fda);
+ 
+-int transport_open(struct transport *t, const char *name,
++int transport_open(struct transport *t, struct interface *iface,
+ 		   struct fdarray *fda, enum timestamp_type tt);
+ 
+ int transport_recv(struct transport *t, int fd, struct ptp_message *msg);
+diff --git a/transport_private.h b/transport_private.h
+index b54f32a..7530896 100644
+--- a/transport_private.h
++++ b/transport_private.h
+@@ -32,8 +32,8 @@ struct transport {
+ 
+ 	int (*close)(struct transport *t, struct fdarray *fda);
+ 
+-	int (*open)(struct transport *t, const char *name, struct fdarray *fda,
+-		    enum timestamp_type tt);
++	int (*open)(struct transport *t, struct interface *iface,
++		    struct fdarray *fda, enum timestamp_type tt);
+ 
+ 	int (*recv)(struct transport *t, int fd, void *buf, int buflen,
+ 		    struct address *addr, struct hw_timestamp *hwts);
+diff --git a/udp.c b/udp.c
+index 530a2ee..05c2ba0 100644
+--- a/udp.c
++++ b/udp.c
+@@ -152,12 +152,13 @@ enum { MC_PRIMARY, MC_PDELAY };
+ 
+ static struct in_addr mcast_addr[2];
+ 
+-static int udp_open(struct transport *t, const char *name, struct fdarray *fda,
+-		    enum timestamp_type ts_type)
++static int udp_open(struct transport *t, struct interface *iface,
++		    struct fdarray *fda, enum timestamp_type ts_type)
+ {
+ 	struct udp *udp = container_of(t, struct udp, t);
+ 	uint8_t event_dscp, general_dscp;
+ 	int efd, gfd, ttl;
++	char *name = iface->name;
+ 
+ 	ttl = config_get_int(t->cfg, name, "udp_ttl");
+ 	udp->mac.len = 0;
+@@ -180,7 +181,7 @@ static int udp_open(struct transport *t, const char *name, struct fdarray *fda,
+ 	if (gfd < 0)
+ 		goto no_general;
+ 
+-	if (sk_timestamping_init(efd, name, ts_type, TRANS_UDP_IPV4))
++	if (sk_timestamping_init(efd, iface->ts_label, ts_type, TRANS_UDP_IPV4))
+ 		goto no_timestamping;
+ 
+ 	if (sk_general_init(gfd))
+diff --git a/udp6.c b/udp6.c
+index 89e27bf..7551e3f 100644
+--- a/udp6.c
++++ b/udp6.c
+@@ -160,12 +160,13 @@ enum { MC_PRIMARY, MC_PDELAY };
+ 
+ static struct in6_addr mc6_addr[2];
+ 
+-static int udp6_open(struct transport *t, const char *name, struct fdarray *fda,
+-		    enum timestamp_type ts_type)
++static int udp6_open(struct transport *t, struct interface *iface,
++		     struct fdarray *fda, enum timestamp_type ts_type)
+ {
+ 	struct udp6 *udp6 = container_of(t, struct udp6, t);
+ 	uint8_t event_dscp, general_dscp;
+ 	int efd, gfd, hop_limit;
++	char *name = iface->name;
+ 
+ 	hop_limit = config_get_int(t->cfg, name, "udp_ttl");
+ 	udp6->mac.len = 0;
+@@ -190,7 +191,7 @@ static int udp6_open(struct transport *t, const char *name, struct fdarray *fda,
+ 	if (gfd < 0)
+ 		goto no_general;
+ 
+-	if (sk_timestamping_init(efd, name, ts_type, TRANS_UDP_IPV6))
++	if (sk_timestamping_init(efd, iface->ts_label, ts_type, TRANS_UDP_IPV6))
+ 		goto no_timestamping;
+ 
+ 	if (sk_general_init(gfd))
+diff --git a/uds.c b/uds.c
+index d5e8f50..7e11f63 100644
+--- a/uds.c
++++ b/uds.c
+@@ -52,13 +52,14 @@ static int uds_close(struct transport *t, struct fdarray *fda)
+ 	return 0;
+ }
+ 
+-static int uds_open(struct transport *t, const char *name, struct fdarray *fda,
++static int uds_open(struct transport *t, struct interface *iface, struct fdarray *fda,
+ 		    enum timestamp_type tt)
+ {
+ 	int fd, err;
+ 	struct sockaddr_un sa;
+ 	struct uds *uds = container_of(t, struct uds, t);
+ 	char *uds_path = config_get_string(t->cfg, NULL, "uds_address");
++	char *name = iface->name;
+ 
+ 	fd = socket(AF_LOCAL, SOCK_DGRAM, 0);
+ 	if (fd < 0) {
+commit cb53238d5d1a1b9319536b4df1edf237e428d931
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:48 2017 +0800
+
+    phc2sys: split servo_add from function clock_add
+    
+    We also need this part in clock_reinit() later. So split it out of
+    function clock_add().
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/phc2sys.c b/phc2sys.c
+index e2b5c47..0472c68 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -162,12 +162,45 @@ static clockid_t clock_open(char *device, int *phc_index)
+ 	return clkid;
+ }
+ 
++static struct servo *servo_add(struct node *node, struct clock *clock)
++{
++	double ppb;
++	int max_ppb;
++	struct servo *servo;
++
++	clockadj_init(clock->clkid);
++	ppb = clockadj_get_freq(clock->clkid);
++	/* The reading may silently fail and return 0, reset the frequency to
++	   make sure ppb is the actual frequency of the clock. */
++	clockadj_set_freq(clock->clkid, ppb);
++	if (clock->clkid == CLOCK_REALTIME) {
++		sysclk_set_leap(0);
++		max_ppb = sysclk_max_freq();
++	} else {
++		max_ppb = phc_max_adj(clock->clkid);
++		if (!max_ppb) {
++			pr_err("clock is not adjustable");
++			return NULL;
++		}
++	}
++
++	servo = servo_create(phc2sys_config, node->servo_type,
++			     -ppb, max_ppb, 0);
++	if (!servo) {
++		pr_err("Failed to create servo");
++		return NULL;
++	}
++
++	servo_sync_interval(servo, node->phc_interval);
++
++	return servo;
++}
++
+ static struct clock *clock_add(struct node *node, char *device)
+ {
+ 	struct clock *c;
+ 	clockid_t clkid = CLOCK_INVALID;
+-	int max_ppb, phc_index = -1;
+-	double ppb;
++	int phc_index = -1;
+ 
+ 	if (device) {
+ 		clkid = clock_open(device, &phc_index);
+@@ -211,25 +244,7 @@ static struct clock *clock_add(struct node *node, char *device)
+ 		}
+ 	}
+ 
+-	clockadj_init(c->clkid);
+-	ppb = clockadj_get_freq(c->clkid);
+-	/* The reading may silently fail and return 0, reset the frequency to
+-	   make sure ppb is the actual frequency of the clock. */
+-	clockadj_set_freq(c->clkid, ppb);
+-	if (c->clkid == CLOCK_REALTIME) {
+-		sysclk_set_leap(0);
+-		max_ppb = sysclk_max_freq();
+-	} else {
+-		max_ppb = phc_max_adj(c->clkid);
+-		if (!max_ppb) {
+-			pr_err("clock is not adjustable");
+-			return NULL;
+-		}
+-	}
+-
+-	c->servo = servo_create(phc2sys_config, node->servo_type,
+-				-ppb, max_ppb, 0);
+-	servo_sync_interval(c->servo, node->phc_interval);
++	c->servo = servo_add(node, c);
+ 
+ 	if (clkid != CLOCK_REALTIME)
+ 		c->sysoff_supported = (SYSOFF_SUPPORTED ==
+commit 8a349e557c653d24b04b0545e2f179080e10731f
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:49 2017 +0800
+
+    phc2sys: re-create clock clkid and servo when phc index changed
+    
+    When the clock device or phc index changed, the new phc device may have
+    different maximum adjustment. So we need to create a new clkid and servo
+    in clock_reinit().
+    
+    At the same time, we should not only do clock_reinit() when the new state
+    is PS_MASTER. We also need to reinit clock after a failover in slave mode(
+    the new state is PS_SLAVE). We can do clock_reinit() even in PS_FAULTY so
+    we can finish adjust offset before come back to PS_LISTENING. So I removed
+    the check and let's do clock_reinit() whenever there is a new state.
+    
+    And for servo reset, as Miroslav suggested, we will do it in these cases:
+    - the system clock is the new destination (master state)
+    - a PHC is the new destination (master state)
+    - a PHC is switched (in any state)
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/phc2sys.c b/phc2sys.c
+index 0472c68..5c54055 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -128,6 +128,11 @@ static int clock_handle_leap(struct node *node, struct clock *clock,
+ static int run_pmc_get_utc_offset(struct node *node, int timeout);
+ static void run_pmc_events(struct node *node);
+ 
++static int normalize_state(int state);
++static int run_pmc_port_properties(struct node *node, int timeout,
++				   unsigned int port,
++				   int *state, int *tstamping, char *iface);
++
+ static clockid_t clock_open(char *device, int *phc_index)
+ {
+ 	struct sk_ts_info ts_info;
+@@ -309,15 +314,62 @@ static struct port *port_add(struct node *node, unsigned int number,
+ 	return p;
+ }
+ 
+-static void clock_reinit(struct clock *clock)
++static void clock_reinit(struct node *node, struct clock *clock, int new_state)
+ {
+-	servo_reset(clock->servo);
+-	clock->servo_state = SERVO_UNLOCKED;
++	int phc_index = -1, phc_switched = 0;
++	int state, timestamping, ret = -1;
++	struct port *p;
++	struct servo *servo;
++	struct sk_ts_info ts_info;
++	char iface[IFNAMSIZ];
++	clockid_t clkid = CLOCK_INVALID;
+ 
+-	if (clock->offset_stats) {
+-		stats_reset(clock->offset_stats);
+-		stats_reset(clock->freq_stats);
+-		stats_reset(clock->delay_stats);
++	LIST_FOREACH(p, &node->ports, list) {
++		if (p->clock == clock) {
++			ret = run_pmc_port_properties(node, 1000, p->number,
++					              &state, &timestamping,
++						      iface);
++			if (ret > 0)
++				p->state = normalize_state(state);
++		}
++	}
++
++	if (ret > 0 && timestamping != TS_SOFTWARE) {
++		/* Check if device changed */
++		if (strcmp(clock->device, iface)) {
++			free(clock->device);
++			clock->device = strdup(iface);
++		}
++		/* Check if phc index changed */
++		if (!sk_get_ts_info(clock->device, &ts_info) &&
++		    clock->phc_index != ts_info.phc_index) {
++			clkid = clock_open(clock->device, &phc_index);
++			if (clkid == CLOCK_INVALID)
++				return;
++
++			phc_close(clock->clkid);
++			clock->clkid = clkid;
++			clock->phc_index = phc_index;
++
++			servo = servo_add(node, clock);
++			if (servo) {
++				servo_destroy(clock->servo);
++				clock->servo = servo;
++			}
++
++			phc_switched = 1;
++		}
++	}
++
++	if (new_state == PS_MASTER || phc_switched) {
++		servo_reset(clock->servo);
++		clock->servo_state = SERVO_UNLOCKED;
++
++		if (clock->offset_stats) {
++			stats_reset(clock->offset_stats);
++			stats_reset(clock->freq_stats);
++			stats_reset(clock->delay_stats);
++		}
+ 	}
+ }
+ 
+@@ -336,9 +388,7 @@ static void reconfigure(struct node *node)
+ 		}
+ 
+ 		if (c->new_state) {
+-			if (c->new_state == PS_MASTER)
+-				clock_reinit(c);
+-
++			clock_reinit(node, c, c->new_state);
+ 			c->state = c->new_state;
+ 			c->new_state = 0;
+ 		}
+@@ -403,7 +453,7 @@ static void reconfigure(struct node *node)
+ 	} else if (rt) {
+ 		if (rt->state != PS_MASTER) {
+ 			rt->state = PS_MASTER;
+-			clock_reinit(rt);
++			clock_reinit(node, rt, rt->state);
+ 		}
+ 		pr_info("selecting %s for synchronization", rt->device);
+ 	}
+commit 7092db303028d84574138c8199375dfde0b4e232
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Mon Oct 9 22:31:50 2017 +0800
+
+    port: return timestamping iface in port properties
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index 1e3f474..d8e29d5 100644
+--- a/port.c
++++ b/port.c
+@@ -861,7 +861,7 @@ static int port_management_fill_response(struct port *target,
+ 		else
+ 			ppn->port_state = target->state;
+ 		ppn->timestamping = target->timestamping;
+-		ptp_text_set(&ppn->interface, target->name);
++		ptp_text_set(&ppn->interface, target->iface->ts_label);
+ 		datalen = sizeof(*ppn) + ppn->interface.length;
+ 		respond = 1;
+ 		break;
+commit 5ce04f9bf366c6d62db5344a6553f87a99ea52ff
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Wed Oct 18 20:31:38 2017 +0800
+
+    phc2sys: update '-s' option
+    
+    Add description about bond interface.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/phc2sys.8 b/phc2sys.8
+index 2559c74..4fc4fa3 100644
+--- a/phc2sys.8
++++ b/phc2sys.8
+@@ -94,7 +94,11 @@ together with the
+ option, the master clock is used only to correct the offset by whole number of
+ seconds, which cannot be fixed with PPS alone. Not compatible with the
+ .B \-a
+-option.
++option. This option does not support bonded interface (e.g. bond0). If
++.B ptp4l
++has a port on an active-backup bond interface, the
++.B \-a
++option can be used to track the active interface.
+ .TP
+ .BI \-i " interface"
+ Performs the exact same function as

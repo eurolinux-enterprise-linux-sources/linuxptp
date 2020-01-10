@@ -3,7 +3,7 @@
 %global clknetsim_ver ce89a1
 Name:		linuxptp
 Version:	1.8
-Release:	3%{?dist}.1
+Release:	5%{?dist}
 Summary:	PTP implementation for Linux
 
 Group:		System Environment/Base
@@ -28,10 +28,20 @@ Patch2:		linuxptp-messagetag.patch
 Patch3:		linuxptp-swtscheck.patch
 # fix leaks of sockets in error handling
 Patch4:		linuxptp-closesocket.patch
-# force BMC election when link goes down
-Patch5:		linuxptp-linkdown.patch
+# update port dispatch code (needed by other patches)
+Patch5:		linuxptp-portdispatch.patch
 # Fix phc2sys to check both the state and new_state variables of the clock
-Patch6:   linuxptp-statechange.patch
+Patch6:		linuxptp-statechange.patch
+# fix handling of unknown/invalid management TLVs in pmc
+Patch7:		linuxptp-mgttlv.patch
+# add support for IP over InfiniBand
+Patch8:		linuxptp-ipoib.patch
+# force BMC election when link goes down
+Patch9:		linuxptp-linkdown.patch
+# fix phc2sys to not synchronize clock to itself
+Patch10:	linuxptp-multiport.patch
+# add support for active-backup bonding
+Patch11:	linuxptp-bonding.patch
 
 BuildRequires:	systemd-units
 
@@ -52,8 +62,13 @@ Supporting legacy APIs and other platforms is not a goal.
 %patch2 -p1 -b .messagetag
 %patch3 -p1 -b .swtscheck
 %patch4 -p1 -b .closesocket
-%patch5 -p1 -b .linkdown
+%patch5 -p1 -b .portdispatch
 %patch6 -p1 -b .statechange
+%patch7 -p1 -b .mgttlv
+%patch8 -p1 -b .ipoib
+%patch9 -p1 -b .linkdown
+%patch10 -p1 -b .multiport
+%patch11 -p1 -b .bonding
 mv linuxptp-testsuite-%{testsuite_ver}* testsuite
 mv clknetsim-%{clknetsim_ver}* testsuite/clknetsim
 
@@ -112,8 +127,13 @@ PATH=..:$PATH ./run
 %{_mandir}/man8/*.8*
 
 %changelog
-* Fri Sep 08 2017 Michal Ruprich <mruprich@redhat.com> 1.8-3.1
-- Resolves: #1489425 - Race condition in phc2sys
+* Tue Oct 24 2017 Miroslav Lichvar <mlichvar@redhat.com> 1.8-5
+- add support for active-backup bonding (#1002657)
+- add support for IP over InfiniBand (#1472880)
+- fix handling of unknown/invalid management TLVs in pmc (#1459446 #1459449)
+
+* Thu Sep 07 2017 Michal Ruprich <mruprich@redhat.com> - 1.8-4
+- Resolves: #1487522 - Race condition in phc2sys
 
 * Wed Mar 15 2017 Miroslav Lichvar <mlichvar@redhat.com> 1.8-3
 - fix backport of linkdown patch

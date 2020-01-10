@@ -1,0 +1,434 @@
+commit 10d4e7f8b0525bbf72981e3e5fcf0c10833a7631
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Tue Jan 3 20:55:18 2017 +0100
+
+    port: Make the finite state machine into a function variable.
+    
+    This allows adding new FSM flavors in the future.
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/port.c b/port.c
+index a1ad6f6..afe0057 100644
+--- a/port.c
++++ b/port.c
+@@ -94,6 +94,8 @@ struct port {
+ 	unsigned int pdr_missing;
+ 	unsigned int multiple_seq_pdr_count;
+ 	unsigned int multiple_pdr_detected;
++	enum port_state (*state_machine)(enum port_state state,
++					 enum fsm_event event, int mdiff);
+ 	/* portDS */
+ 	struct PortIdentity portIdentity;
+ 	enum port_state     state; /*portState*/
+@@ -2142,10 +2144,8 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 		if (event == EV_RS_MASTER || event == EV_RS_GRAND_MASTER) {
+ 			port_slave_priority_warning(p);
+ 		}
+-		next = ptp_slave_fsm(p->state, event, mdiff);
+-	} else {
+-		next = ptp_fsm(p->state, event, mdiff);
+ 	}
++	next = p->state_machine(p->state, event, mdiff);
+ 
+ 	if (!fault_interval(p, last_fault_type(p), &i) &&
+ 	    ((i.val == FRI_ASAP && i.type == FTMO_LOG2_SECONDS) ||
+@@ -2555,6 +2555,7 @@ struct port *port_open(int phc_index,
+ 
+ 	memset(p, 0, sizeof(*p));
+ 
++	p->state_machine = clock_slave_only(clock) ? ptp_slave_fsm : ptp_fsm;
+ 	p->phc_index = phc_index;
+ 	p->jbod = config_get_int(cfg, interface->name, "boundary_clock_jbod");
+ 	transport = config_get_int(cfg, interface->name, "network_transport");
+
+commit 80a28a9dc322f28b991effc44ec1c5362a598281
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Tue Jan 3 20:55:33 2017 +0100
+
+    Change a misleading fault handling function signature.
+    
+    Looking at the fault logic in port_dispatch(), you might think that
+    the function, fault_interval(), checks whether a fault is active, but
+    you would be wrong, since that function always returns zero.
+    
+    This patch removes the superfluous input error checking inside of
+    fault_interval() and changes the return type to void, making the
+    actual behavior explicit.  Dropping the input check is safe because
+    that function has exactly two callers, both of whom always provide
+    valid inputs.
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/port.c b/port.c
+index afe0057..6c9aa72 100644
+--- a/port.c
++++ b/port.c
+@@ -205,16 +205,11 @@ enum fault_type last_fault_type(struct port *port)
+ 	return port->last_fault_type;
+ }
+ 
+-int fault_interval(struct port *port, enum fault_type ft,
+-	struct fault_interval *i)
++void fault_interval(struct port *port, enum fault_type ft,
++		    struct fault_interval *i)
+ {
+-	if (!port || !i)
+-		return -EINVAL;
+-	if (ft < 0 || ft >= FT_CNT)
+-		return -EINVAL;
+ 	i->type = port->flt_interval_pertype[ft].type;
+ 	i->val = port->flt_interval_pertype[ft].val;
+-	return 0;
+ }
+ 
+ int port_fault_fd(struct port *port)
+@@ -2147,9 +2142,9 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	}
+ 	next = p->state_machine(p->state, event, mdiff);
+ 
+-	if (!fault_interval(p, last_fault_type(p), &i) &&
+-	    ((i.val == FRI_ASAP && i.type == FTMO_LOG2_SECONDS) ||
+-	     (i.val == 0 && i.type == FTMO_LINEAR_SECONDS)))
++	fault_interval(p, last_fault_type(p), &i);
++	if ((i.val == FRI_ASAP && i.type == FTMO_LOG2_SECONDS) ||
++	     (i.val == 0 && i.type == FTMO_LINEAR_SECONDS))
+ 		fri_asap = 1;
+ 	if (PS_INITIALIZING == next || (PS_FAULTY == next && fri_asap)) {
+ 		/*
+diff --git a/port.h b/port.h
+index 19dec4a..d2e0865 100644
+--- a/port.h
++++ b/port.h
+@@ -318,9 +318,8 @@ enum fault_type last_fault_type(struct port *port);
+  * @param port        A port instance.
+  * @param ft          Fault type.
+  * @param i           Pointer to the struct which will be filled in.
+- * @return Zero on success, non-zero otherwise.
+  */
+-int fault_interval(struct port *port, enum fault_type ft,
+-	struct fault_interval *i);
++void fault_interval(struct port *port, enum fault_type ft,
++		    struct fault_interval *i);
+ 
+ #endif
+
+commit 1f66948d3853c8b08c7f52c9c8daecb361164a43
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Tue Jan 3 20:55:42 2017 +0100
+
+    Make the fault handling code more readable.
+    
+    The code that decides whether a fault qualifies for ASAP treatment is
+    a tangle of logical operators.  This patch replaces the open coded
+    logic with a helper function whose name makes the intent clear.  This
+    is a cosmetic change only.
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/port.c b/port.c
+index 6c9aa72..02dbabb 100644
+--- a/port.c
++++ b/port.c
+@@ -161,6 +161,19 @@ static void announce_to_dataset(struct ptp_message *m, struct port *p,
+ 	out->receiver     = p->portIdentity;
+ }
+ 
++static int clear_fault_asap(struct fault_interval *faint)
++{
++	switch (faint->type) {
++	case FTMO_LINEAR_SECONDS:
++		return faint->val == 0 ? 1 : 0;
++	case FTMO_LOG2_SECONDS:
++		return faint->val == FRI_ASAP ? 1 : 0;
++	case FTMO_CNT:
++		return 0;
++	}
++	return 0;
++}
++
+ static int msg_current(struct ptp_message *m, struct timespec now)
+ {
+ 	int64_t t1, t2, tmo;
+@@ -2143,9 +2156,9 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	next = p->state_machine(p->state, event, mdiff);
+ 
+ 	fault_interval(p, last_fault_type(p), &i);
+-	if ((i.val == FRI_ASAP && i.type == FTMO_LOG2_SECONDS) ||
+-	     (i.val == 0 && i.type == FTMO_LINEAR_SECONDS))
++	if (clear_fault_asap(&i)) {
+ 		fri_asap = 1;
++	}
+ 	if (PS_INITIALIZING == next || (PS_FAULTY == next && fri_asap)) {
+ 		/*
+ 		 * This is a special case. Since we initialize the
+
+commit 01ee947457813078f63d606c310818d6dedb4ca3
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Tue Jan 3 20:55:50 2017 +0100
+
+    Disentangle initialization from fault clearing.
+    
+    Although leaving the INITIALIZING state and clearing the FAULTY state
+    ASAP both result in a port entering the LISTENING state, still there
+    is no benefit from conflating the two.  In the FAULTY case, the
+    current code actually skips the INITIALIZING state altogether.
+    
+    This patch separates the two cases resulting in two benefits.  First,
+    the check for ASAP fault status is only made when a fault is actually
+    present, unlike the present unconditional check.  Second, this change
+    will allow us to cleanly support alternative state machines later on.
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/port.c b/port.c
+index 02dbabb..ebe7342 100644
+--- a/port.c
++++ b/port.c
+@@ -2145,8 +2145,6 @@ static void port_p2p_transition(struct port *p, enum port_state next)
+ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ {
+ 	enum port_state next;
+-	struct fault_interval i;
+-	int fri_asap = 0;
+ 
+ 	if (clock_slave_only(p->clock)) {
+ 		if (event == EV_RS_MASTER || event == EV_RS_GRAND_MASTER) {
+@@ -2155,11 +2153,15 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	}
+ 	next = p->state_machine(p->state, event, mdiff);
+ 
+-	fault_interval(p, last_fault_type(p), &i);
+-	if (clear_fault_asap(&i)) {
+-		fri_asap = 1;
++	if (PS_FAULTY == next) {
++		struct fault_interval i;
++		fault_interval(p, last_fault_type(p), &i);
++		if (clear_fault_asap(&i)) {
++			pr_notice("port %hu: clearing fault immediately", portnum(p));
++			next = PS_INITIALIZING;
++		}
+ 	}
+-	if (PS_INITIALIZING == next || (PS_FAULTY == next && fri_asap)) {
++	if (PS_INITIALIZING == next) {
+ 		/*
+ 		 * This is a special case. Since we initialize the
+ 		 * port immediately, we can skip right to listening
+
+commit b738afb6044a8c59310fc13f646c8f5c4dcf2963
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Thu Oct 27 15:20:36 2016 +0200
+
+    fsm: Make the transition out of INITIALIZING part of the FSM code.
+    
+    The state machines in 1588 do not specify an event that causes a transition
+    out of the initializing state.  This was left as a local issue.  For this
+    transition, the current code assigns the next state outside of the FSM.  But
+    doing so prevents an alternative FSM to handle this transition differently.
+    
+    By introducing a new event, this patch places this transition where it
+    belongs, namely under the control of the FSM code,
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/fsm.c b/fsm.c
+index d1423e7..ce6efad 100644
+--- a/fsm.c
++++ b/fsm.c
+@@ -27,7 +27,16 @@ enum port_state ptp_fsm(enum port_state state, enum fsm_event event, int mdiff)
+ 
+ 	switch (state) {
+ 	case PS_INITIALIZING:
+-		next = PS_LISTENING;
++		switch (event) {
++		case EV_FAULT_DETECTED:
++			next = PS_FAULTY;
++			break;
++		case EV_INIT_COMPLETE:
++			next = PS_LISTENING;
++			break;
++		default:
++			break;
++		}
+ 		break;
+ 
+ 	case PS_FAULTY:
+@@ -220,7 +229,16 @@ enum port_state ptp_slave_fsm(enum port_state state, enum fsm_event event,
+ 
+ 	switch (state) {
+ 	case PS_INITIALIZING:
+-		next = PS_LISTENING;
++		switch (event) {
++		case EV_FAULT_DETECTED:
++			next = PS_FAULTY;
++			break;
++		case EV_INIT_COMPLETE:
++			next = PS_LISTENING;
++			break;
++		default:
++			break;
++		}
+ 		break;
+ 
+ 	case PS_FAULTY:
+diff --git a/fsm.h b/fsm.h
+index 5d4ae91..0616daa 100644
+--- a/fsm.h
++++ b/fsm.h
+@@ -48,6 +48,7 @@ enum fsm_event {
+ 	EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES,
+ 	EV_SYNCHRONIZATION_FAULT,
+ 	EV_MASTER_CLOCK_SELECTED,
++	EV_INIT_COMPLETE,
+ 	EV_RS_MASTER,
+ 	EV_RS_GRAND_MASTER,
+ 	EV_RS_SLAVE,
+diff --git a/port.c b/port.c
+index ebe7342..5f1646b 100644
+--- a/port.c
++++ b/port.c
+@@ -2120,6 +2120,7 @@ static void port_p2p_transition(struct port *p, enum port_state next)
+ 		break;
+ 	case PS_LISTENING:
+ 		port_set_announce_tmo(p);
++		port_set_delay_tmo(p);
+ 		break;
+ 	case PS_PRE_MASTER:
+ 		port_set_qualification_tmo(p);
+@@ -2158,7 +2159,7 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 		fault_interval(p, last_fault_type(p), &i);
+ 		if (clear_fault_asap(&i)) {
+ 			pr_notice("port %hu: clearing fault immediately", portnum(p));
+-			next = PS_INITIALIZING;
++			next = p->state_machine(next, EV_FAULT_CLEARED, 0);
+ 		}
+ 	}
+ 	if (PS_INITIALIZING == next) {
+@@ -2170,14 +2171,12 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 		if (port_is_enabled(p)) {
+ 			port_disable(p);
+ 		}
+-		next = port_initialize(p) ? PS_FAULTY : PS_LISTENING;
+-		port_show_transition(p, next, event);
+-		p->state = next;
+-		if (next == PS_LISTENING && p->delayMechanism == DM_P2P) {
+-			port_set_delay_tmo(p);
++		if (port_initialize(p)) {
++			event = EV_FAULT_DETECTED;
++		} else {
++			event = EV_INIT_COMPLETE;
+ 		}
+-		port_notify_event(p, NOTIFY_PORT_STATE);
+-		return 1;
++		next = p->state_machine(next, event, 0);
+ 	}
+ 
+ 	if (next == p->state)
+diff --git a/util.c b/util.c
+index 594b49f..2b880ff 100644
+--- a/util.c
++++ b/util.c
+@@ -61,6 +61,7 @@ const char *ev_str[] = {
+ 	"ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES",
+ 	"SYNCHRONIZATION_FAULT",
+ 	"MASTER_CLOCK_SELECTED",
++	"INIT_COMPLETE",
+ 	"RS_MASTER",
+ 	"RS_GRAND_MASTER",
+ 	"RS_SLAVE",
+
+commit 6b471d45edfdfa835a9115ce4be96d92f100e2ac
+Author: Richard Cochran <richardcochran@gmail.com>
+Date:   Sun Feb 5 18:25:18 2017 +0100
+
+    port: Change port_dispatch() into a void function.
+    
+    This global function used to return an error code, but now it always
+    returns zero.  This patch converts the function signature to return void
+    and simplifies the main clock loop by removing the useless test.
+    
+    Signed-off-by: Richard Cochran <richardcochran@gmail.com>
+
+diff --git a/clock.c b/clock.c
+index a6a1a1a..f027305 100644
+--- a/clock.c
++++ b/clock.c
+@@ -1463,7 +1463,7 @@ struct PortIdentity clock_parent_identity(struct clock *c)
+ 
+ int clock_poll(struct clock *c)
+ {
+-	int cnt, err, i, sde = 0;
++	int cnt, i, sde = 0;
+ 	enum fsm_event event;
+ 	struct pollfd *cur;
+ 	struct port *p;
+@@ -1490,14 +1490,14 @@ int clock_poll(struct clock *c)
+ 	cur++;
+ 	LIST_FOREACH(p, &c->ports, list) {
+ 		/* Let the ports handle their events. */
+-		for (i = err = 0; i < N_POLLFD && !err; i++) {
++		for (i = 0; i < N_POLLFD; i++) {
+ 			if (cur[i].revents & (POLLIN|POLLPRI)) {
+ 				event = port_event(p, i);
+ 				if (EV_STATE_DECISION_EVENT == event)
+ 					sde = 1;
+ 				if (EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES == event)
+ 					sde = 1;
+-				err = port_dispatch(p, event, 0);
++				port_dispatch(p, event, 0);
+ 				/* Clear any fault after a little while. */
+ 				if (PS_FAULTY == port_state(p)) {
+ 					clock_fault_timeout(p, 1);
+diff --git a/port.c b/port.c
+index 5f1646b..0f99b1b 100644
+--- a/port.c
++++ b/port.c
+@@ -2143,7 +2143,7 @@ static void port_p2p_transition(struct port *p, enum port_state next)
+ 	};
+ }
+ 
+-int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
++void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ {
+ 	enum port_state next;
+ 
+@@ -2180,7 +2180,7 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	}
+ 
+ 	if (next == p->state)
+-		return 0;
++		return;
+ 
+ 	port_show_transition(p, next, event);
+ 
+@@ -2196,12 +2196,11 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	if (p->jbod && next == PS_UNCALIBRATED) {
+ 		if (clock_switch_phc(p->clock, p->phc_index)) {
+ 			p->last_fault_type = FT_SWITCH_PHC;
+-			return port_dispatch(p, EV_FAULT_DETECTED, 0);
++			port_dispatch(p, EV_FAULT_DETECTED, 0);
++			return;
+ 		}
+ 		clock_sync_interval(p->clock, p->log_sync_interval);
+ 	}
+-
+-	return 0;
+ }
+ 
+ enum fsm_event port_event(struct port *p, int fd_index)
+diff --git a/port.h b/port.h
+index d2e0865..b00bc64 100644
+--- a/port.h
++++ b/port.h
+@@ -69,10 +69,8 @@ struct foreign_clock *port_compute_best(struct port *port);
+  * @param port A pointer previously obtained via port_open().
+  * @param event One of the @a fsm_event codes.
+  * @param mdiff Whether a new master has been selected.
+- * @return Zero if the port's file descriptor array is still valid,
+- *         and non-zero if it has become invalid.
+  */
+-int port_dispatch(struct port *p, enum fsm_event event, int mdiff);
++void port_dispatch(struct port *p, enum fsm_event event, int mdiff);
+ 
+ /**
+  * Generates state machine events based on activity on a port's file

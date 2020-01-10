@@ -1,0 +1,50 @@
+commit 43b2f5d1207a010f1df67e101b129b09502371e2
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Fri May 12 15:36:45 2017 +0800
+
+    msg: use last_tlv if there is not enough room for another tlv
+    
+    If the len is not enought for another tlv process. e.g. one more bytes
+    padding at the end of message. And we set extra to NULL instead of
+    msg->last_tlv in tlv_post_recv(). Then the msg->last_tlv will not be
+    initialised. And program will crash if we read msg->last_tlv. e.g. in
+    function pmc_show().
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/msg.c b/msg.c
+index a38b815..4b3d926 100644
+--- a/msg.c
++++ b/msg.c
+@@ -140,7 +140,7 @@ static int suffix_post_recv(uint8_t *ptr, int len, struct tlv_extra *last)
+ 		}
+ 		len -= tlv->length;
+ 		ptr += tlv->length;
+-		err = tlv_post_recv(tlv, len ? NULL : last);
++		err = tlv_post_recv(tlv, len > sizeof(struct TLV) ? NULL : last);
+ 		if (err)
+ 			return err;
+ 	}
+commit 95b5a13cb2787b6a436ad395bb4931d1661e59a7
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Tue May 23 14:49:55 2017 +0800
+
+    pmc: goto out when get unknown management tlv
+    
+    If handle unknown management tlv. The management message id and format are
+    also unknown, thus we may crash due to access unknown area.
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/pmc.c b/pmc.c
+index cefa771..af9cc63 100644
+--- a/pmc.c
++++ b/pmc.c
+@@ -217,6 +217,7 @@ static void pmc_show(struct ptp_message *msg, FILE *fp)
+ 		goto out;
+ 	} else {
+ 		fprintf(fp, "unknown-tlv ");
++		goto out;
+ 	}
+ 	mgt = (struct management_tlv *) msg->management.suffix;
+ 	if (mgt->length == 2 && mgt->id != TLV_NULL_MANAGEMENT) {
