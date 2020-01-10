@@ -1,0 +1,24 @@
+commit 241d8a064efa535029e28b87a8995add3cca8c0c
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Tue Sep 25 18:16:19 2018 +0200
+
+    unicast: Process timeouts equal to current time.
+    
+    Don't postpone processing of a timeout if it is equal to the current
+    time. This prevents an infinite loop with a simulated clock.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/unicast_service.c b/unicast_service.c
+index ad0e06a..9c9b95b 100644
+--- a/unicast_service.c
++++ b/unicast_service.c
+@@ -502,7 +502,7 @@ int unicast_service_timer(struct port *p)
+ 		pr_debug("peek i={2^%d} tmo={%ld,%ld}", interval->log_period,
+ 			 interval->tmo.tv_sec, interval->tmo.tv_nsec);
+ 
+-		if (timespec_compare(&now, &interval->tmo) >= 0) {
++		if (timespec_compare(&now, &interval->tmo) > 0) {
+ 			break;
+ 		}
+ 		interval = pqueue_extract(p->unicast_service->queue);

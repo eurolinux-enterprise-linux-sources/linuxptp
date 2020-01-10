@@ -1,0 +1,459 @@
+commit 8ca81014a352a125aab38fce2b1302d92c0f5ef2
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Fri Mar 1 15:08:48 2019 +0800
+
+    rtnl: add team activebackup support
+    
+    This patch add team interface activebackup mode support. As linux team use
+    genl netlink message, when we get a rtnl link change notify, we have to setup
+    a new genl socket and request the current active port.
+    
+    v2: check nlmsg_len before copy rta_data
+    v3: a) Do not make rtnl_buf global as it may be freed by calling rtnl_close()
+           while we are using it in rtnl_link_status()
+        b) Reorder declarations of variables as reversed Christmas tree for
+           function rtnl_link_status()
+        c) remove rtnl_len
+    v4: Remove the first !rtnl_buf check in rtnl_link_status as it's alway true
+    v5: a) Re-order {nl, rtnl}_open and add function nl_close()
+        b) revert the v3_{a,c}, v4 changes, use nl_close to close genl fd
+        c) do not use len in get_team_active_iface() as it may mislead reader
+    
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/missing.h b/missing.h
+index 2f7adb9..8f92079 100644
+--- a/missing.h
++++ b/missing.h
+@@ -118,6 +118,22 @@ enum {
+ #define IFLA_BOND_MAX   (__IFLA_BOND_MAX - 1)
+ #endif	/*IFLA_BOND_MAX*/
+ 
++#ifndef NLA_TYPE_MAX
++enum {
++        NLA_UNSPEC,
++        NLA_U8,
++        NLA_U16,
++        NLA_U32,
++        NLA_U64,
++        NLA_STRING,
++        NLA_FLAG,
++        NLA_MSECS,
++        NLA_NESTED,
++        __NLA_TYPE_MAX,
++};
++#define NLA_TYPE_MAX (__NLA_TYPE_MAX - 1)
++#endif /*NLA_TYPE_MAX*/
++
+ #ifdef __UCLIBC__
+ 
+ #if (_XOPEN_SOURCE >= 600 || _POSIX_C_SOURCE >= 200112L) && \
+diff --git a/phc2sys.8 b/phc2sys.8
+index 45cb0e3..b3a3de3 100644
+--- a/phc2sys.8
++++ b/phc2sys.8
+@@ -108,9 +108,9 @@ together with the
+ option, the master clock is used only to correct the offset by whole number of
+ seconds, which cannot be fixed with PPS alone. Not compatible with the
+ .B \-a
+-option. This option does not support bonded interface (e.g. bond0). If
++option. This option does not support bonded interface (e.g. bond0, team0). If
+ .B ptp4l
+-has a port on an active-backup bond interface, the
++has a port on an active-backup bond or team interface, the
+ .B \-a
+ option can be used to track the active interface.
+ .TP
+diff --git a/rtnl.c b/rtnl.c
+index f9a572b..e3758b3 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -20,6 +20,8 @@
+ #include <sys/socket.h> /* Must come before linux/netlink.h on some systems. */
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
++#include <linux/genetlink.h>
++#include <linux/if_team.h>
+ #include <net/if.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -30,8 +32,39 @@
+ #include "print.h"
+ #include "rtnl.h"
+ 
++#define BUF_SIZE 4096
++#define GENLMSG_DATA(glh) ((void *)(NLMSG_DATA(glh) + GENL_HDRLEN))
++
+ static int rtnl_len;
+ static char *rtnl_buf;
++static int get_team_active_iface(int master_index);
++
++static int nl_close(int fd)
++{
++	return close(fd);
++}
++
++static int nl_open(int family)
++{
++	int fd;
++	struct sockaddr_nl sa;
++
++	memset(&sa, 0, sizeof(sa));
++	sa.nl_family = AF_NETLINK;
++	sa.nl_groups = RTNLGRP_LINK;
++
++	fd = socket(AF_NETLINK, SOCK_RAW, family);
++	if (fd < 0) {
++		pr_err("failed to open netlink socket: %m");
++		return -1;
++	}
++	if (bind(fd, (struct sockaddr *) &sa, sizeof(sa))) {
++		pr_err("failed to bind netlink socket: %m");
++		close(fd);
++		return -1;
++	}
++	return fd;
++}
+ 
+ int rtnl_close(int fd)
+ {
+@@ -40,7 +73,12 @@ int rtnl_close(int fd)
+ 		rtnl_buf = NULL;
+ 		rtnl_len = 0;
+ 	}
+-	return close(fd);
++	return nl_close(fd);
++}
++
++int rtnl_open(void)
++{
++	return nl_open(NETLINK_ROUTE);
+ }
+ 
+ static void rtnl_get_ts_device_callback(void *ctx, int linkup, int ts_index)
+@@ -116,14 +154,24 @@ int rtnl_link_query(int fd, char *device)
+ 	return 0;
+ }
+ 
+-static inline __u32 rta_getattr_u32(const struct rtattr *rta)
++static inline __u8 rta_getattr_u8(struct rtattr *rta)
++{
++	return *(__u8 *)RTA_DATA(rta);
++}
++
++static inline __u16 rta_getattr_u16(struct rtattr *rta)
++{
++	return *(__u16 *)RTA_DATA(rta);
++}
++
++static inline __u32 rta_getattr_u32(struct rtattr *rta)
+ {
+ 	return *(__u32 *)RTA_DATA(rta);
+ }
+ 
+-static inline const char *rta_getattr_str(const struct rtattr *rta)
++static inline char *rta_getattr_str(struct rtattr *rta)
+ {
+-	return (const char *)RTA_DATA(rta);
++	return (char *)RTA_DATA(rta);
+ }
+ 
+ static int rtnl_rtattr_parse(struct rtattr *tb[], int max, struct rtattr *rta, int len)
+@@ -150,12 +198,12 @@ static inline int rtnl_nested_rtattr_parse(struct rtattr *tb[], int max, struct
+ 	return rtnl_rtattr_parse(tb, max, RTA_DATA(rta), RTA_PAYLOAD(rta));
+ }
+ 
+-static int rtnl_linkinfo_parse(struct rtattr *rta)
++static int rtnl_linkinfo_parse(int master_index, struct rtattr *rta)
+ {
+-	int index = -1;
+-	const char *kind;
+ 	struct rtattr *linkinfo[IFLA_INFO_MAX];
+ 	struct rtattr *bond[IFLA_BOND_MAX];
++	int index = -1;
++	char *kind;
+ 
+ 	if (rtnl_nested_rtattr_parse(linkinfo, IFLA_INFO_MAX, rta) < 0)
+ 		return -1;
+@@ -172,6 +220,8 @@ static int rtnl_linkinfo_parse(struct rtattr *rta)
+ 			if (bond[IFLA_BOND_ACTIVE_SLAVE]) {
+ 				index = rta_getattr_u32(bond[IFLA_BOND_ACTIVE_SLAVE]);
+ 			}
++		} else if (kind && !strncmp(kind, "team", 4)) {
++			index = get_team_active_iface(master_index);
+ 		}
+ 	}
+ 	return index;
+@@ -179,18 +229,18 @@ static int rtnl_linkinfo_parse(struct rtattr *rta)
+ 
+ int rtnl_link_status(int fd, char *device, rtnl_callback cb, void *ctx)
+ {
++	struct rtattr *tb[IFLA_MAX+1];
++	struct ifinfomsg *info = NULL;
+ 	int index, len, link_up;
+-	int slave_index = -1;
+-	struct iovec iov;
+ 	struct sockaddr_nl sa;
+-	struct msghdr msg;
++	int slave_index = -1;
+ 	struct nlmsghdr *nh;
+-	struct ifinfomsg *info = NULL;
+-	struct rtattr *tb[IFLA_MAX+1];
++	struct msghdr msg;
++	struct iovec iov;
+ 
+ 	index = if_nametoindex(device);
+ 	if (!rtnl_buf) {
+-		rtnl_len = 4096;
++		rtnl_len = BUF_SIZE;
+ 		rtnl_buf = malloc(rtnl_len);
+ 		if (!rtnl_buf) {
+ 			pr_err("rtnl: low memory");
+@@ -246,7 +296,7 @@ int rtnl_link_status(int fd, char *device, rtnl_callback cb, void *ctx)
+ 				  IFLA_PAYLOAD(nh));
+ 
+ 		if (tb[IFLA_LINKINFO])
+-			slave_index = rtnl_linkinfo_parse(tb[IFLA_LINKINFO]);
++			slave_index = rtnl_linkinfo_parse(index, tb[IFLA_LINKINFO]);
+ 
+ 		if (cb)
+ 			cb(ctx, link_up, slave_index);
+@@ -255,24 +305,164 @@ int rtnl_link_status(int fd, char *device, rtnl_callback cb, void *ctx)
+ 	return 0;
+ }
+ 
+-int rtnl_open(void)
++static int genl_send_msg(int fd, int family_id, int genl_cmd, int genl_version,
++		  int rta_type, void *rta_data, int rta_len)
+ {
+-	int fd;
+-	struct sockaddr_nl sa;
++	struct sockaddr_nl daddr;
++	struct genlmsghdr *gnlh;
++	struct nlmsghdr *nlh;
++	struct rtattr *attr;
++	char msg[BUF_SIZE];
+ 
+-	memset(&sa, 0, sizeof(sa));
+-	sa.nl_family = AF_NETLINK;
+-	sa.nl_groups = RTNLGRP_LINK;
++	memset(&daddr, 0, sizeof(daddr));
++	daddr.nl_family = AF_NETLINK;
+ 
+-	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+-	if (fd < 0) {
+-		pr_err("failed to open netlink socket: %m");
++	memset(&msg, 0, sizeof(msg));
++	nlh = (struct nlmsghdr *) msg;
++	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
++	nlh->nlmsg_type = family_id;
++	nlh->nlmsg_flags = NLM_F_REQUEST;
++
++	gnlh = (struct genlmsghdr *) NLMSG_DATA(nlh);
++	gnlh->cmd = genl_cmd;
++	gnlh->version = genl_version;
++
++	if (rta_data && rta_len > 0) {
++		attr = (struct rtattr *) GENLMSG_DATA(msg);
++		attr->rta_type = rta_type;
++		attr->rta_len = RTA_LENGTH(rta_len);
++		nlh->nlmsg_len += NLMSG_ALIGN(attr->rta_len);
++		if (nlh->nlmsg_len < sizeof(msg))
++			memcpy(RTA_DATA(attr), rta_data, rta_len);
++		else
++			return -1;
++	}
++
++	return sendto(fd, &msg, nlh->nlmsg_len, 0,
++		      (struct sockaddr *)&daddr, sizeof(daddr));
++}
++
++static int genl_get_family_id(int fd, void *family_name)
++{
++	struct rtattr *tb[CTRL_ATTR_MAX+1];
++	struct nlmsghdr *nlh;
++	struct rtattr *attr;
++	char msg[BUF_SIZE];
++	int len, gf_id;
++
++	len = genl_send_msg(fd, GENL_ID_CTRL, CTRL_CMD_GETFAMILY, 1,
++			    CTRL_ATTR_FAMILY_NAME, family_name,
++			    strlen(family_name) + 1);
++	if (len < 0)
++		return len;
++
++	len = recv(fd, &msg, sizeof(msg), 0);
++	if (len < 0)
++		return len;
++
++	nlh = (struct nlmsghdr *) msg;
++	if (nlh->nlmsg_type == NLMSG_ERROR || !NLMSG_OK(nlh, len))
+ 		return -1;
++
++	attr = (struct rtattr *) GENLMSG_DATA(msg);
++	rtnl_rtattr_parse(tb, CTRL_ATTR_MAX, attr, NLMSG_PAYLOAD(nlh, GENL_HDRLEN));
++
++	if (tb[CTRL_ATTR_FAMILY_ID])
++		gf_id = rta_getattr_u16(tb[CTRL_ATTR_FAMILY_ID]);
++	else
++		gf_id = -1;
++
++	return gf_id;
++}
++
++static int parase_team_list_option(struct rtattr *attr)
++{
++	struct rtattr *tb[TEAM_ATTR_OPTION_MAX+1];
++	int len = RTA_PAYLOAD(attr);
++	const char *optname = "";
++	const char *mode = "";
++	int active_index = -1;
++
++	for (attr = RTA_DATA(attr); RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
++		rtnl_nested_rtattr_parse(tb, TEAM_ATTR_OPTION_MAX, attr);
++
++		if (tb[TEAM_ATTR_OPTION_NAME])
++			optname = rta_getattr_str(tb[TEAM_ATTR_OPTION_NAME]);
++
++		if (!strcmp(optname, "mode") && tb[TEAM_ATTR_OPTION_TYPE] &&
++		    rta_getattr_u8(tb[TEAM_ATTR_OPTION_TYPE]) == NLA_STRING)
++			mode = rta_getattr_str(tb[TEAM_ATTR_OPTION_DATA]);
++
++		if (!strcmp(optname, "activeport") && tb[TEAM_ATTR_OPTION_TYPE] &&
++		    rta_getattr_u8(tb[TEAM_ATTR_OPTION_TYPE]) == NLA_U32)
++			active_index = rta_getattr_u32(tb[TEAM_ATTR_OPTION_DATA]);
+ 	}
+-	if (bind(fd, (struct sockaddr *) &sa, sizeof(sa))) {
+-		pr_err("failed to bind netlink socket: %m");
+-		close(fd);
++
++	if (strcmp(mode, "activebackup")) {
++		pr_err("team supported only in activebackup mode");
+ 		return -1;
++	} else {
++		return active_index;
+ 	}
+-	return fd;
++}
++
++static int get_team_active_iface(int master_index)
++{
++	struct rtattr *tb[TEAM_ATTR_MAX+1];
++	struct genlmsghdr *gnlh;
++	struct nlmsghdr *nlh;
++	char msg[BUF_SIZE];
++	int fd, gf_id, len;
++	int index = -1;
++
++	fd = nl_open(NETLINK_GENERIC);
++	if (fd < 0)
++		return fd;
++
++	gf_id = genl_get_family_id(fd, TEAM_GENL_NAME);
++	if (gf_id < 0) {
++		pr_err("get genl family failed");
++		goto no_info;
++	}
++
++	len = genl_send_msg(fd, gf_id, TEAM_CMD_OPTIONS_GET,
++			    TEAM_GENL_VERSION, TEAM_ATTR_TEAM_IFINDEX,
++			    &master_index, sizeof(master_index));
++	if (len < 0) {
++		pr_err("send team info request failed: %m");
++		goto no_info;
++	}
++
++	len = recv(fd, msg, sizeof(msg), 0);
++	if (len < 0) {
++		pr_err("recv team info failed: %m");
++		goto no_info;
++	}
++
++	nlh = (struct nlmsghdr *) msg;
++	for ( ; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len)) {
++		if (nlh->nlmsg_type != gf_id)
++			continue;
++
++		gnlh = (struct genlmsghdr *) NLMSG_DATA(nlh);
++		if (gnlh->cmd != TEAM_CMD_OPTIONS_GET)
++			continue;
++
++		rtnl_rtattr_parse(tb, TEAM_ATTR_MAX, (struct rtattr *)GENLMSG_DATA(msg),
++				  NLMSG_PAYLOAD(nlh, GENL_HDRLEN));
++
++		if (tb[TEAM_ATTR_TEAM_IFINDEX] &&
++		    master_index != rta_getattr_u32(tb[TEAM_ATTR_TEAM_IFINDEX]))
++			continue;
++
++		if (tb[TEAM_ATTR_LIST_OPTION]) {
++			index = parase_team_list_option(tb[TEAM_ATTR_LIST_OPTION]);
++			break;
++		}
++	}
++
++	return index;
++no_info:
++	nl_close(fd);
++	return -1;
+ }
+commit d8eafa6a39a609597e6c1ce44d616ba6f33c27f8
+Author: Hangbin Liu <liuhangbin@gmail.com>
+Date:   Wed Mar 20 14:44:13 2019 +0800
+
+    port: should check the new phc_index before switching
+    
+    In logic, when we want to switch phc, we should check if the new phc
+    index is valid instead of checking the previous one.
+    
+    In reality, if we use linux team interface with activebackup mode. As
+    teamd is a userspace tool, it sets the new slave as active port after
+    receiving link change message. If we set current active port down and
+    another slave up. There is a race that we receive the new slave's link
+    up message while active port(ts_index) is still the old one. This means
+    we may use a link down interface as ts_index and get phc_index with -1.
+    
+    If we update the p->phc_index to -1, there will be no possibility to
+    change it back to other value as we swith phc only when p->phc_index >= 0.
+    
+    With this fix, we will not switch phc_index until receiving the real
+    active port(p->iface->ts_info.phc_index >= 0) update message.
+    
+    Reported-by: Miroslav Lichvar <mlichvar@redhat.com>
+    Fixes: 536a71031d5c ("ptp4l: use ts label to get ts info")
+    Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+
+diff --git a/port.c b/port.c
+index ad9554f..49c6f76 100644
+--- a/port.c
++++ b/port.c
+@@ -2442,7 +2442,7 @@ void port_link_status(void *ctx, int linkup, int ts_index)
+ 		sk_get_ts_info(p->iface->ts_label, &p->iface->ts_info);
+ 
+ 		/* Only switch phc with HW time stamping mode */
+-		if (p->phc_index >= 0 && p->iface->ts_info.valid) {
++		if (p->iface->ts_info.valid && p->iface->ts_info.phc_index >= 0) {
+ 			required_modes = clock_required_modes(p->clock);
+ 			if ((p->iface->ts_info.so_timestamping & required_modes) != required_modes) {
+ 				pr_err("interface '%s' does not support requested "
+commit ecfbea2dac2312cb61aa5d2fe1646ee4c6b18643
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Thu Mar 21 15:44:32 2019 +0100
+
+    rtnl: close file descriptor in get_team_active_iface()
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/rtnl.c b/rtnl.c
+index e3758b3..59ed0ec 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -461,8 +461,7 @@ static int get_team_active_iface(int master_index)
+ 		}
+ 	}
+ 
+-	return index;
+ no_info:
+ 	nl_close(fd);
+-	return -1;
++	return index;
+ }

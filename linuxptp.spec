@@ -1,9 +1,9 @@
 %global _hardened_build 1
-%global testsuite_ver 502e82
-%global clknetsim_ver ce89a1
+%global testsuite_ver a7f6e1
+%global clknetsim_ver 8b4842
 Name:		linuxptp
-Version:	1.8
-Release:	6%{?dist}
+Version:	2.0
+Release:	2%{?dist}
 Summary:	PTP implementation for Linux
 
 Group:		System Environment/Base
@@ -20,33 +20,22 @@ Source10:	https://github.com/mlichvar/linuxptp-testsuite/archive/%{testsuite_ver
 # simulator for test suite
 Source11:	https://github.com/mlichvar/clknetsim/archive/%{clknetsim_ver}/clknetsim-%{clknetsim_ver}.tar.gz
 
-# update default TAI-UTC offset and make it configurable
-Patch1:		linuxptp-utcoffset.patch
-# add options to tag ptp4l/phc2sys log messages and use them in timemaster
-Patch2:		linuxptp-messagetag.patch
-# check support for SW timestamping in timemaster
-Patch3:		linuxptp-swtscheck.patch
-# fix leaks of sockets in error handling
-Patch4:		linuxptp-closesocket.patch
-# update port dispatch code (needed by other patches)
-Patch5:		linuxptp-portdispatch.patch
-# Fix phc2sys to check both the state and new_state variables of the clock
-Patch6:		linuxptp-statechange.patch
-# fix handling of unknown/invalid management TLVs in pmc
-Patch7:		linuxptp-mgttlv.patch
-# add support for IP over InfiniBand
-Patch8:		linuxptp-ipoib.patch
-# force BMC election when link goes down
-Patch9:		linuxptp-linkdown.patch
-# fix phc2sys to not synchronize clock to itself
-Patch10:	linuxptp-multiport.patch
-# add support for active-backup bonding
-Patch11:	linuxptp-bonding.patch
-# don't forward management requests to UDS port
-Patch12:	linuxptp-udsmgt.patch
-# improve timemaster to restart terminated processes
-Patch13:	linuxptp-tmasterrestart.patch
+# fix building with new kernel headers
+Patch1:		linuxptp-headers.patch
+# fix timeout handling to work with simulated clock
+Patch2:		linuxptp-timeout.patch
+# add support for more accurate synchronization to phc2sys
+Patch3:		linuxptp-sysoff.patch
+# limit unicast message rate per address and grant duration
+Patch4:		linuxptp-ucastrate.patch
+# add support for active-backup team interface
+Patch5:		linuxptp-team.patch
+# fix comparing of unicast addresses
+Patch6:		linuxptp-addreq.patch
+# don't leak memory when allocation fails
+Patch7:		linuxptp-msgput.patch
 
+BuildRequires:	kernel-headers > 3.10.0-1002
 BuildRequires:	systemd-units
 
 Requires(post):	systemd-units
@@ -62,19 +51,13 @@ Supporting legacy APIs and other platforms is not a goal.
 
 %prep
 %setup -q -a 10 -a 11
-%patch1 -p1 -b .utcoffset
-%patch2 -p1 -b .messagetag
-%patch3 -p1 -b .swtscheck
-%patch4 -p1 -b .closesocket
-%patch5 -p1 -b .portdispatch
-%patch6 -p1 -b .statechange
-%patch7 -p1 -b .mgttlv
-%patch8 -p1 -b .ipoib
-%patch9 -p1 -b .linkdown
-%patch10 -p1 -b .multiport
-%patch11 -p1 -b .bonding
-%patch12 -p1 -b .udsmgt
-%patch13 -p1 -b .tmasterrestart
+%patch1 -p1 -b .headers
+%patch2 -p1 -b .timeout
+%patch3 -p1 -b .sysoff
+%patch4 -p1 -b .ucastrate
+%patch5 -p1 -b .team
+%patch6 -p1 -b .addreq
+%patch7 -p1 -b .msgput
 mv linuxptp-testsuite-%{testsuite_ver}* testsuite
 mv clknetsim-%{clknetsim_ver}* testsuite/clknetsim
 
@@ -87,7 +70,7 @@ make %{?_smp_mflags} \
 %makeinstall
 
 mkdir -p $RPM_BUILD_ROOT{%{_sysconfdir}/sysconfig,%{_unitdir},%{_mandir}/man5}
-install -m 644 -p default.cfg $RPM_BUILD_ROOT%{_sysconfdir}/ptp4l.conf
+install -m 644 -p configs/default.cfg $RPM_BUILD_ROOT%{_sysconfdir}/ptp4l.conf
 install -m 644 -p %{SOURCE1} %{SOURCE2} %{SOURCE3} $RPM_BUILD_ROOT%{_unitdir}
 install -m 644 -p %{SOURCE4} $RPM_BUILD_ROOT%{_sysconfdir}
 
@@ -115,7 +98,7 @@ PATH=..:$PATH ./run
 %systemd_postun_with_restart phc2sys.service ptp4l.service timemaster.service
 
 %files
-%doc COPYING README.org default.cfg gPTP.cfg
+%doc COPYING README.org configs
 %config(noreplace) %{_sysconfdir}/ptp4l.conf
 %config(noreplace) %{_sysconfdir}/sysconfig/phc2sys
 %config(noreplace) %{_sysconfdir}/sysconfig/ptp4l
@@ -124,6 +107,7 @@ PATH=..:$PATH ./run
 %{_unitdir}/ptp4l.service
 %{_unitdir}/timemaster.service
 %{_sbindir}/hwstamp_ctl
+%{_sbindir}/nsm
 %{_sbindir}/phc2sys
 %{_sbindir}/phc_ctl
 %{_sbindir}/pmc
@@ -133,6 +117,16 @@ PATH=..:$PATH ./run
 %{_mandir}/man8/*.8*
 
 %changelog
+* Tue Mar 26 2019 Miroslav Lichvar <mlichvar@redhat.com> 2.0-2
+- fix comparing of unicast addresses
+- don't leak memory when allocation fails
+
+* Thu Mar 21 2019 Miroslav Lichvar <mlichvar@redhat.com> 2.0-1
+- update to 2.0 (#1623919)
+- add support for more accurate synchronization to phc2sys (#1643977)
+- add support for active-backup team interface (#1650672)
+- limit unicast message rate per address and grant duration
+
 * Wed May 30 2018 Miroslav Lichvar <mlichvar@redhat.com> 1.8-6
 - add support for bonding to timemaster (#1549015)
 - improve timemaster to restart terminated processes (#1527170)

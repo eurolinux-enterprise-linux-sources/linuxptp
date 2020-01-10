@@ -1,0 +1,20 @@
+commit 86723cfc6a7ac1d9b1bff5e90b7f4696d6460a0e
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Thu Mar 21 17:12:03 2019 +0100
+
+    pmc: Don't leak memory when msg_tlv_append() fails.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/pmc_common.c b/pmc_common.c
+index 4a160f6..4d48e3a 100644
+--- a/pmc_common.c
++++ b/pmc_common.c
+@@ -546,6 +546,7 @@ int pmc_send_set_action(struct pmc *pmc, int id, void *data, int datasize)
+ 	}
+ 	extra = msg_tlv_append(msg, sizeof(*mgt) + datasize);
+ 	if (!extra) {
++		msg_put(msg);
+ 		return -ENOMEM;
+ 	}
+ 	mgt = (struct management_tlv *) extra->tlv;

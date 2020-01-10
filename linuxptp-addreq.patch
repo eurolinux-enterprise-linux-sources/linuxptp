@@ -1,0 +1,12 @@
+diff -up linuxptp-2.0/util.c.addreq linuxptp-2.0/util.c
+--- linuxptp-2.0/util.c.addreq	2019-03-25 11:43:55.878146767 +0100
++++ linuxptp-2.0/util.c	2019-03-25 11:44:38.215244483 +0100
+@@ -78,7 +78,7 @@ int addreq(enum transport_type type, str
+ 	case TRANS_UDP_IPV4:
+ 		bufa = &a->sin.sin_addr;
+ 		bufb = &b->sin.sin_addr;
+-		len = sizeof(a->sin);
++		len = sizeof(a->sin.sin_addr);
+ 		break;
+ 	case TRANS_IEEE_802_3:
+ 		bufa = &a->sll.sll_addr;

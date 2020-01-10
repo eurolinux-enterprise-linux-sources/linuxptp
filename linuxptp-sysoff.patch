@@ -1,0 +1,403 @@
+commit c0e49c708814ec783726fe92202371847703c5ed
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Nov 12 17:27:58 2018 +0100
+
+    sysoff: Initialize data for ioctl(PTP_SYS_OFFSET).
+    
+    This fixes valgrind errors.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/sysoff.c b/sysoff.c
+index f7b6240..407a01c 100644
+--- a/sysoff.c
++++ b/sysoff.c
+@@ -18,6 +18,7 @@
+  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+  */
+ #include <stdio.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <linux/ptp_clock.h>
+ 
+@@ -76,6 +77,7 @@ int sysoff_measure(int fd, int n_samples,
+ 		   int64_t *result, uint64_t *ts, int64_t *delay)
+ {
+ 	struct ptp_sys_offset pso;
++	memset(&pso, 0, sizeof(pso));
+ 	pso.n_samples = n_samples;
+ 	if (ioctl(fd, PTP_SYS_OFFSET, &pso)) {
+ 		perror("ioctl PTP_SYS_OFFSET");
+
+commit 93baf34adb81046a5e1c3b9a3e685029f2046993
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Nov 12 17:27:59 2018 +0100
+
+    sysoff: Extend API for different sysoff methods.
+    
+    The kernel supports different PTP_SYS_OFFSET* ioctls. Use the sysoff
+    enum to allow selecting between them in sysoff_measure().
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/phc2sys.c b/phc2sys.c
+index 15f8d75..2cd477a 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -74,7 +74,7 @@ struct clock {
+ 	LIST_ENTRY(clock) dst_list;
+ 	clockid_t clkid;
+ 	int phc_index;
+-	int sysoff_supported;
++	int sysoff_method;
+ 	int is_utc;
+ 	int dest_only;
+ 	int state;
+@@ -255,9 +255,8 @@ static struct clock *clock_add(struct node *node, char *device)
+ 		c->servo = servo_add(node, c);
+ 
+ 	if (clkid != CLOCK_INVALID && clkid != CLOCK_REALTIME)
+-		c->sysoff_supported = (SYSOFF_SUPPORTED ==
+-				       sysoff_probe(CLOCKID_TO_FD(clkid),
+-						    node->phc_readings));
++		c->sysoff_method = sysoff_probe(CLOCKID_TO_FD(clkid),
++						node->phc_readings);
+ 
+ 	LIST_INSERT_HEAD(&node->clocks, c, list);
+ 	return c;
+@@ -784,11 +783,12 @@ static int do_loop(struct node *node, int subscriptions)
+ 				continue;
+ 
+ 			if (clock->clkid == CLOCK_REALTIME &&
+-			    node->master->sysoff_supported) {
++			    node->master->sysoff_method >= 0) {
+ 				/* use sysoff */
+ 				if (sysoff_measure(CLOCKID_TO_FD(node->master->clkid),
++						   node->master->sysoff_method,
+ 						   node->phc_readings,
+-						   &offset, &ts, &delay))
++						   &offset, &ts, &delay) < 0)
+ 					return -1;
+ 			} else {
+ 				/* use phc */
+diff --git a/phc_ctl.c b/phc_ctl.c
+index 4a78a19..b9a9cf4 100644
+--- a/phc_ctl.c
++++ b/phc_ctl.c
+@@ -367,10 +367,12 @@ static int do_cmp(clockid_t clkid, int cmdc, char *cmdv[])
+ 	struct timespec ts, rta, rtb;
+ 	int64_t sys_offset, delay = 0, offset;
+ 	uint64_t sys_ts;
++	int method;
+ 
+-	if (SYSOFF_SUPPORTED ==
+-	    sysoff_measure(CLOCKID_TO_FD(clkid),
+-			   9, &sys_offset, &sys_ts, &delay)) {
++	method = sysoff_probe(CLOCKID_TO_FD(clkid), 9);
++
++	if (method >= 0 && sysoff_measure(CLOCKID_TO_FD(clkid), method, 9,
++					  &sys_offset, &sys_ts, &delay) >= 0) {
+ 		pr_notice( "offset from CLOCK_REALTIME is %"PRId64"ns\n",
+ 			sys_offset);
+ 		return 0;
+diff --git a/sysoff.c b/sysoff.c
+index 407a01c..f709a9b 100644
+--- a/sysoff.c
++++ b/sysoff.c
+@@ -73,8 +73,8 @@ static int64_t sysoff_estimate(struct ptp_clock_time *pct, int n_samples,
+ 	return samples[0].offset;
+ }
+ 
+-int sysoff_measure(int fd, int n_samples,
+-		   int64_t *result, uint64_t *ts, int64_t *delay)
++static int sysoff_basic(int fd, int n_samples,
++			int64_t *result, uint64_t *ts, int64_t *delay)
+ {
+ 	struct ptp_sys_offset pso;
+ 	memset(&pso, 0, sizeof(pso));
+@@ -84,13 +84,24 @@ int sysoff_measure(int fd, int n_samples,
+ 		return SYSOFF_RUN_TIME_MISSING;
+ 	}
+ 	*result = sysoff_estimate(pso.ts, n_samples, ts, delay);
+-	return SYSOFF_SUPPORTED;
++	return SYSOFF_BASIC;
++}
++
++int sysoff_measure(int fd, int method, int n_samples,
++		   int64_t *result, uint64_t *ts, int64_t *delay)
++{
++	switch (method) {
++	case SYSOFF_BASIC:
++		return sysoff_basic(fd, n_samples, result, ts, delay);
++	}
++	return SYSOFF_COMPILE_TIME_MISSING;
+ }
+ 
+ int sysoff_probe(int fd, int n_samples)
+ {
+ 	int64_t junk, delay;
+ 	uint64_t ts;
++	int i;
+ 
+ 	if (n_samples > PTP_MAX_SAMPLES) {
+ 		fprintf(stderr, "warning: %d exceeds kernel max readings %d\n",
+@@ -99,7 +110,13 @@ int sysoff_probe(int fd, int n_samples)
+ 		return SYSOFF_RUN_TIME_MISSING;
+ 	}
+ 
+-	return sysoff_measure(fd, n_samples, &junk, &ts, &delay);
++	for (i = 0; i < SYSOFF_LAST; i++) {
++		if (sysoff_measure(fd, i, n_samples, &junk, &ts, &delay) < 0)
++			continue;
++		return i;
++	}
++
++	return SYSOFF_RUN_TIME_MISSING;
+ }
+ 
+ #else /* !PTP_SYS_OFFSET */
+diff --git a/sysoff.h b/sysoff.h
+index cb70265..02ecdfa 100644
+--- a/sysoff.h
++++ b/sysoff.h
+@@ -21,13 +21,14 @@
+ #include <stdint.h>
+ 
+ enum {
+-	SYSOFF_SUPPORTED,
+-	SYSOFF_COMPILE_TIME_MISSING,
+-	SYSOFF_RUN_TIME_MISSING,
++	SYSOFF_COMPILE_TIME_MISSING = -2,
++	SYSOFF_RUN_TIME_MISSING = -1,
++	SYSOFF_BASIC,
++	SYSOFF_LAST,
+ };
+ 
+ /**
+- * Check to see if the PTP_SYS_OFFSET ioctl is supported.
++ * Check to see if a PTP_SYS_OFFSET ioctl is supported.
+  * @param fd  An open file descriptor to a PHC device.
+  * @return  One of the SYSOFF_ enumeration values.
+  */
+@@ -36,11 +37,12 @@ int sysoff_probe(int fd, int n_samples);
+ /**
+  * Measure the offset between a PHC and the system time.
+  * @param fd         An open file descriptor to a PHC device.
++ * @param method     A non-negative SYSOFF_ value returned by sysoff_probe().
+  * @param n_samples  The number of consecutive readings to make.
+  * @param result     The estimated offset in nanoseconds.
+  * @param ts         The system time corresponding to the 'result'.
+  * @param delay      The delay in reading of the clock in nanoseconds.
+  * @return  One of the SYSOFF_ enumeration values.
+  */
+-int sysoff_measure(int fd, int n_samples,
++int sysoff_measure(int fd, int method, int n_samples,
+ 		   int64_t *result, uint64_t *ts, int64_t *delay);
+
+commit 192b8e315c4585489d7aa7f59683035998805e40
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Nov 12 17:28:00 2018 +0100
+
+    sysoff: Add support for PTP_SYS_OFFSET_PRECISE ioctl.
+    
+    This ioctl uses cross timestamping for a more accurate measurement of
+    the offset. It is supported on some onboard Intel NICs using the e1000e
+    driver and a virtual PHC with the ptp_kvm driver.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/sysoff.c b/sysoff.c
+index f709a9b..9f65d95 100644
+--- a/sysoff.c
++++ b/sysoff.c
+@@ -22,6 +22,7 @@
+ #include <sys/ioctl.h>
+ #include <linux/ptp_clock.h>
+ 
++#include "print.h"
+ #include "sysoff.h"
+ 
+ #define NS_PER_SEC 1000000000LL
+@@ -39,6 +40,23 @@ static struct {
+ 	uint64_t timestamp;
+ } samples[PTP_MAX_SAMPLES];
+ 
++static int sysoff_precise(int fd, int64_t *result, uint64_t *ts)
++{
++#ifdef PTP_SYS_OFFSET_PRECISE
++	struct ptp_sys_offset_precise pso;
++	memset(&pso, 0, sizeof(pso));
++	if (ioctl(fd, PTP_SYS_OFFSET_PRECISE, &pso)) {
++		pr_debug("ioctl PTP_SYS_OFFSET_PRECISE: %m");
++		return SYSOFF_RUN_TIME_MISSING;
++	}
++	*result = pctns(&pso.sys_realtime) - pctns(&pso.device);
++	*ts = pctns(&pso.sys_realtime);
++	return SYSOFF_PRECISE;
++#else
++	return SYSOFF_COMPILE_TIME_MISSING;
++#endif
++}
++
+ static void insertion_sort(int length, int64_t interval, int64_t offset, uint64_t ts)
+ {
+ 	int i = length - 1;
+@@ -91,6 +109,9 @@ int sysoff_measure(int fd, int method, int n_samples,
+ 		   int64_t *result, uint64_t *ts, int64_t *delay)
+ {
+ 	switch (method) {
++	case SYSOFF_PRECISE:
++		*delay = 0;
++		return sysoff_precise(fd, result, ts);
+ 	case SYSOFF_BASIC:
+ 		return sysoff_basic(fd, n_samples, result, ts, delay);
+ 	}
+diff --git a/sysoff.h b/sysoff.h
+index 02ecdfa..37f7353 100644
+--- a/sysoff.h
++++ b/sysoff.h
+@@ -23,6 +23,7 @@
+ enum {
+ 	SYSOFF_COMPILE_TIME_MISSING = -2,
+ 	SYSOFF_RUN_TIME_MISSING = -1,
++	SYSOFF_PRECISE,
+ 	SYSOFF_BASIC,
+ 	SYSOFF_LAST,
+ };
+
+commit 68a9011c9d7d859920da339ba59c14dc1d617a45
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Nov 12 17:28:01 2018 +0100
+
+    sysoff: Add support for PTP_SYS_OFFSET_EXTENDED ioctl.
+    
+    This is a more accurate variant of the the PTP_SYS_OFFSET ioctl, which
+    will probably be supported in future kernel versions.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/sysoff.c b/sysoff.c
+index 9f65d95..b993ee9 100644
+--- a/sysoff.c
++++ b/sysoff.c
+@@ -71,17 +71,23 @@ static void insertion_sort(int length, int64_t interval, int64_t offset, uint64_
+ 	samples[i+1].timestamp = ts;
+ }
+ 
+-static int64_t sysoff_estimate(struct ptp_clock_time *pct, int n_samples,
+-			       uint64_t *ts, int64_t *delay)
++static int64_t sysoff_estimate(struct ptp_clock_time *pct, int extended,
++			       int n_samples, uint64_t *ts, int64_t *delay)
+ {
+ 	int64_t t1, t2, tp;
+ 	int64_t interval, offset;
+ 	int i;
+ 
+ 	for (i = 0; i < n_samples; i++) {
+-		t1 = pctns(&pct[2*i]);
+-		tp = pctns(&pct[2*i+1]);
+-		t2 = pctns(&pct[2*i+2]);
++		if (extended) {
++			t1 = pctns(&pct[3*i]);
++			tp = pctns(&pct[3*i+1]);
++			t2 = pctns(&pct[3*i+2]);
++		} else {
++			t1 = pctns(&pct[2*i]);
++			tp = pctns(&pct[2*i+1]);
++			t2 = pctns(&pct[2*i+2]);
++		}
+ 		interval = t2 - t1;
+ 		offset = (t2 + t1) / 2 - tp;
+ 		insertion_sort(i, interval, offset, (t2 + t1) / 2);
+@@ -91,6 +97,24 @@ static int64_t sysoff_estimate(struct ptp_clock_time *pct, int n_samples,
+ 	return samples[0].offset;
+ }
+ 
++static int sysoff_extended(int fd, int n_samples,
++			   int64_t *result, uint64_t *ts, int64_t *delay)
++{
++#ifdef PTP_SYS_OFFSET_EXTENDED
++	struct ptp_sys_offset_extended pso;
++	memset(&pso, 0, sizeof(pso));
++	pso.n_samples = n_samples;
++	if (ioctl(fd, PTP_SYS_OFFSET_EXTENDED, &pso)) {
++		pr_debug("ioctl PTP_SYS_OFFSET_EXTENDED: %m");
++		return SYSOFF_RUN_TIME_MISSING;
++	}
++	*result = sysoff_estimate(&pso.ts[0][0], 1, n_samples, ts, delay);
++	return SYSOFF_EXTENDED;
++#else
++	return SYSOFF_COMPILE_TIME_MISSING;
++#endif
++}
++
+ static int sysoff_basic(int fd, int n_samples,
+ 			int64_t *result, uint64_t *ts, int64_t *delay)
+ {
+@@ -101,7 +125,7 @@ static int sysoff_basic(int fd, int n_samples,
+ 		perror("ioctl PTP_SYS_OFFSET");
+ 		return SYSOFF_RUN_TIME_MISSING;
+ 	}
+-	*result = sysoff_estimate(pso.ts, n_samples, ts, delay);
++	*result = sysoff_estimate(pso.ts, 0, n_samples, ts, delay);
+ 	return SYSOFF_BASIC;
+ }
+ 
+@@ -112,6 +136,8 @@ int sysoff_measure(int fd, int method, int n_samples,
+ 	case SYSOFF_PRECISE:
+ 		*delay = 0;
+ 		return sysoff_precise(fd, result, ts);
++	case SYSOFF_EXTENDED:
++		return sysoff_extended(fd, n_samples, result, ts, delay);
+ 	case SYSOFF_BASIC:
+ 		return sysoff_basic(fd, n_samples, result, ts, delay);
+ 	}
+diff --git a/sysoff.h b/sysoff.h
+index 37f7353..79d2290 100644
+--- a/sysoff.h
++++ b/sysoff.h
+@@ -24,6 +24,7 @@ enum {
+ 	SYSOFF_COMPILE_TIME_MISSING = -2,
+ 	SYSOFF_RUN_TIME_MISSING = -1,
+ 	SYSOFF_PRECISE,
++	SYSOFF_EXTENDED,
+ 	SYSOFF_BASIC,
+ 	SYSOFF_LAST,
+ };
+
+commit 8142da41b61fb5b9ee4ad8f5ab56adb0447cd37b
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Nov 12 17:28:02 2018 +0100
+
+    phc2sys: Use reversed sysoff when synchronizing to system clock.
+    
+    If synchronizing a PHC to the system clock, use one of the
+    PTP_SYS_OFFSET ioctls (if supported) to measure the offset between the
+    two clocks. Negate the offset and switch the timestamp before passing
+    them to the servo.
+    
+    This makes the synchronization between PHC and system clock symmetric.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/phc2sys.c b/phc2sys.c
+index 2cd477a..b8f1ea0 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -790,6 +790,16 @@ static int do_loop(struct node *node, int subscriptions)
+ 						   node->phc_readings,
+ 						   &offset, &ts, &delay) < 0)
+ 					return -1;
++			} else if (node->master->clkid == CLOCK_REALTIME &&
++				   clock->sysoff_method >= 0) {
++				/* use reversed sysoff */
++				if (sysoff_measure(CLOCKID_TO_FD(clock->clkid),
++						   clock->sysoff_method,
++						   node->phc_readings,
++						   &offset, &ts, &delay) < 0)
++					return -1;
++				ts += offset;
++				offset = -offset;
+ 			} else {
+ 				/* use phc */
+ 				if (!read_phc(node->master->clkid, clock->clkid,
