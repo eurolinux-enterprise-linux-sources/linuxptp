@@ -3,7 +3,7 @@
 %global clknetsim_ver ce89a1
 Name:		linuxptp
 Version:	1.8
-Release:	5%{?dist}
+Release:	6%{?dist}
 Summary:	PTP implementation for Linux
 
 Group:		System Environment/Base
@@ -42,6 +42,10 @@ Patch9:		linuxptp-linkdown.patch
 Patch10:	linuxptp-multiport.patch
 # add support for active-backup bonding
 Patch11:	linuxptp-bonding.patch
+# don't forward management requests to UDS port
+Patch12:	linuxptp-udsmgt.patch
+# improve timemaster to restart terminated processes
+Patch13:	linuxptp-tmasterrestart.patch
 
 BuildRequires:	systemd-units
 
@@ -69,6 +73,8 @@ Supporting legacy APIs and other platforms is not a goal.
 %patch9 -p1 -b .linkdown
 %patch10 -p1 -b .multiport
 %patch11 -p1 -b .bonding
+%patch12 -p1 -b .udsmgt
+%patch13 -p1 -b .tmasterrestart
 mv linuxptp-testsuite-%{testsuite_ver}* testsuite
 mv clknetsim-%{clknetsim_ver}* testsuite/clknetsim
 
@@ -127,6 +133,12 @@ PATH=..:$PATH ./run
 %{_mandir}/man8/*.8*
 
 %changelog
+* Wed May 30 2018 Miroslav Lichvar <mlichvar@redhat.com> 1.8-6
+- add support for bonding to timemaster (#1549015)
+- improve timemaster to restart terminated processes (#1527170)
+- start ptp4l, timemaster and phc2sys after network-online target (#1541991)
+- don't forward management requests to UDS port (#1520366)
+
 * Tue Oct 24 2017 Miroslav Lichvar <mlichvar@redhat.com> 1.8-5
 - add support for active-backup bonding (#1002657)
 - add support for IP over InfiniBand (#1472880)

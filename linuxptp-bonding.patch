@@ -1669,3 +1669,199 @@ index 2559c74..4fc4fa3 100644
  .TP
  .BI \-i " interface"
  Performs the exact same function as
+
+Backport of
+commit 742f8788211d2a861a0214e76449390b89ba55c2
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Fri Apr 13 17:11:56 2018 +0200
+
+    rtnl: remove dependency on config.h.
+    
+    Change the rtnl_get_ts_label() function to accept the name of the master
+    interface and the buffer for the slave interface directly instead of the
+    struct interface from config.h.
+    
+    Also, rename the function to rtnl_get_ts_device().
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/clock.c b/clock.c
+index 9ffb43e..afee960 100644
+--- a/clock.c
++++ b/clock.c
+@@ -948,7 +948,7 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 	c->timestamping = timestamping;
+ 	required_modes = clock_required_modes(c);
+ 	STAILQ_FOREACH(iface, &config->interfaces, list) {
+-		rtnl_get_ts_label(iface);
++		rtnl_get_ts_device(iface->name, iface->ts_label);
+ 		ensure_ts_label(iface);
+ 		sk_get_ts_info(iface->ts_label, &iface->ts_info);
+ 		if (iface->ts_info.valid &&
+diff --git a/rtnl.c b/rtnl.c
+index cea936b..f9a572b 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -43,13 +43,13 @@ int rtnl_close(int fd)
+ 	return close(fd);
+ }
+ 
+-static void rtnl_get_ts_label_callback(void *ctx, int linkup, int ts_index)
++static void rtnl_get_ts_device_callback(void *ctx, int linkup, int ts_index)
+ {
+ 	int *dst = ctx;
+ 	*dst = ts_index;
+ }
+ 
+-int rtnl_get_ts_label(struct interface *iface)
++int rtnl_get_ts_device(char *device, char *ts_device)
+ {
+ 	int err, fd;
+ 	int ts_index = -1;
+@@ -58,13 +58,13 @@ int rtnl_get_ts_label(struct interface *iface)
+ 	if (fd < 0)
+ 		return fd;
+ 
+-	err = rtnl_link_query(fd, iface->name);
++	err = rtnl_link_query(fd, device);
+ 	if (err) {
+ 		goto no_info;
+ 	}
+ 
+-	rtnl_link_status(fd, iface->name, rtnl_get_ts_label_callback, &ts_index);
+-	if (ts_index > 0 && if_indextoname(ts_index, iface->ts_label))
++	rtnl_link_status(fd, device, rtnl_get_ts_device_callback, &ts_index);
++	if (ts_index > 0 && if_indextoname(ts_index, ts_device))
+ 		err = 0;
+ 	else
+ 		err = -1;
+diff --git a/rtnl.h b/rtnl.h
+index 2906d74..f877cd2 100644
+--- a/rtnl.h
++++ b/rtnl.h
+@@ -20,8 +20,6 @@
+ #ifndef HAVE_RTNL_H
+ #define HAVE_RTNL_H
+ 
+-#include "config.h"
+-
+ typedef void (*rtnl_callback)(void *ctx, int linkup, int ts_index);
+ 
+ /**
+@@ -32,11 +30,14 @@ typedef void (*rtnl_callback)(void *ctx, int linkup, int ts_index);
+ int rtnl_close(int fd);
+ 
+ /**
+- * Get interface ts_label information
+- * @param iface  struct interface.
+- * @return       Zero on success, or -1 on error.
++ * Get name of the slave interface which timestamps packets going through
++ * a master interface (e.g. bond0)
++ * @param device    Name of the master interface.
++ * @param ts_device Buffer for the name of the slave interface, which must be
++ *                  at least IF_NAMESIZE bytes long.
++ * @return          Zero on success, or -1 on error.
+  */
+-int rtnl_get_ts_label(struct interface *iface);
++int rtnl_get_ts_device(char *device, char *ts_device);
+ 
+ /**
+  * Request the link status from the kernel.
+
+commit e5ba2dae5f102a66e152b96f9cc7b06aff4b90b5
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Fri Apr 13 17:11:57 2018 +0200
+
+    timemaster: add support for bonded interfaces.
+    
+    Use the rtnl_get_ts_device() function to get the name of the slave
+    interface which will be timestamping PTP packets and use it instead of
+    the master interface to check the timestamping capabilities and PHC.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/makefile b/makefile
+index 6f5321c..17189e6 100644
+--- a/makefile
++++ b/makefile
+@@ -60,7 +60,7 @@ hwstamp_ctl: hwstamp_ctl.o version.o
+ 
+ phc_ctl: phc_ctl.o phc.o sk.o util.o clockadj.o sysoff.o print.o version.o
+ 
+-timemaster: print.o sk.o timemaster.o util.o version.o
++timemaster: print.o rtnl.o sk.o timemaster.o util.o version.o
+ 
+ version.o: .version version.sh $(filter-out version.d,$(DEPEND))
+ 
+diff --git a/timemaster.c b/timemaster.c
+index cda2d90..fc3ba31 100644
+--- a/timemaster.c
++++ b/timemaster.c
+@@ -23,6 +23,7 @@
+ #include <libgen.h>
+ #include <limits.h>
+ #include <linux/net_tstamp.h>
++#include <net/if.h>
+ #include <signal.h>
+ #include <spawn.h>
+ #include <stdarg.h>
+@@ -35,6 +36,7 @@
+ #include <unistd.h>
+ 
+ #include "print.h"
++#include "rtnl.h"
+ #include "sk.h"
+ #include "util.h"
+ #include "version.h"
+@@ -674,6 +676,7 @@ static int add_ptp_source(struct ptp_domain *source,
+ {
+ 	struct config_file *config_file;
+ 	char **command, *uds_path, **interfaces, *message_tag;
++	char ts_interface[IF_NAMESIZE];
+ 	int i, j, num_interfaces, *phc, *phcs, hw_ts, sw_ts;
+ 	struct sk_ts_info ts_info;
+ 
+@@ -696,26 +699,38 @@ static int add_ptp_source(struct ptp_domain *source,
+ 	for (i = 0; i < num_interfaces; i++) {
+ 		phcs[i] = -1;
+ 
++		/*
++		 * if it is a bonded interface, use the name of the active
++		 * slave interface (which will be timestamping packets)
++		 */
++		if (!rtnl_get_ts_device(source->interfaces[i], ts_interface)) {
++			pr_debug("slave interface of %s: %s",
++				 source->interfaces[i], ts_interface);
++		} else {
++			snprintf(ts_interface, sizeof(ts_interface), "%s",
++				 source->interfaces[i]);
++		}
++
+ 		/* check if the interface has a usable PHC */
+-		if (sk_get_ts_info(source->interfaces[i], &ts_info)) {
++		if (sk_get_ts_info(ts_interface, &ts_info)) {
+ 			pr_err("failed to get time stamping info for %s",
+-			       source->interfaces[i]);
++			       ts_interface);
+ 			free(phcs);
+ 			return 1;
+ 		}
+ 
+ 		if (((ts_info.so_timestamping & hw_ts) != hw_ts)) {
+-			pr_debug("interface %s: no PHC", source->interfaces[i]);
++			pr_debug("interface %s: no PHC", ts_interface);
+ 			if ((ts_info.so_timestamping & sw_ts) != sw_ts) {
+ 				pr_err("time stamping not supported on %s",
+-				       source->interfaces[i]);
++				       ts_interface);
+ 				free(phcs);
+ 				return 1;
+ 			}
+ 			continue;
+ 		}
+ 
+-		pr_debug("interface %s: PHC %d", source->interfaces[i],
++		pr_debug("interface %s: PHC %d", ts_interface,
+ 			 ts_info.phc_index);
+ 
+ 		/* and the PHC isn't already used in another source */

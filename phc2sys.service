@@ -1,6 +1,6 @@
 [Unit]
 Description=Synchronize system clock or PTP hardware clock (PHC)
-After=ntpdate.service
+After=ntpdate.service ptp4l.service
 
 [Service]
 Type=simple

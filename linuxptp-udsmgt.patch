@@ -1,0 +1,37 @@
+commit 303b08cbf55096aba55bd08a314e0701e5c33482
+Author: Miroslav Lichvar <mlichvar@redhat.com>
+Date:   Mon Dec 11 14:21:25 2017 +0100
+
+    clock: Don't forward management requests to UDS port.
+    
+    The UDS port is not expected to be used by PTP clocks and forwarding of
+    management messages to the port can be limited to responses.
+    
+    This prevents ptp4l from printing error messages when a management
+    request is received from a non-UDS port and the last client which used
+    the UDS port is no longer listening.
+    
+    Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/clock.c b/clock.c
+index 41c8f81..6dbc45e 100644
+--- a/clock.c
++++ b/clock.c
+@@ -1243,6 +1243,17 @@ static int clock_do_forward_mgmt(struct clock *c,
+ {
+ 	if (in == out || !forwarding(c, out))
+ 		return 0;
++
++	/* Don't forward any requests to the UDS port. */
++	if (out == c->uds_port) {
++		switch (management_action(msg)) {
++		case GET:
++		case SET:
++		case COMMAND:
++			return 0;
++		}
++	}
++
+ 	if (!*pre_sent) {
+ 		/* delay calling msg_pre_send until
+ 		 * actually forwarding */
