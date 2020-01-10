@@ -1,0 +1,30 @@
+commit 		17c9787b1d6891636b5be9e4e5a08278b44e9a7a
+Author: 	Miroslav Lichvar <mlichvar@redhat.com>
+Date: 		Fri Sep 01 11:42:26 2017 +0100
+
+		phc2sys: fix handling of multiple state changes.
+
+		When the master clock changed its state and then changed it back to the
+		original state before phc2sys could process the first change, e.g. SLAVE
+		-> UNCALIBRATED -> SLAVE after a clockcheck failure, the second change
+		was ignored because the new value was the same as the original state,
+		which wasn't updated for the first change yet. This caused phc2sys to be
+		stuck with a wrong state.
+
+		Fix phc2sys to check both the state and new_state variables of the clock.
+
+		Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+
+diff --git a/phc2sys.c b/phc2sys.c
+index b6f6719..e2b5c47 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -786,7 +786,7 @@ static int recv_subscribed(struct node *node, struct ptp_message *msg,
+ 			port->state = state;
+ 			clock = port->clock;
+ 			state = clock_compute_state(node, clock);
+-			if (clock->state != state) {
++			if (clock->state != state || clock->new_state) {
+ 				clock->new_state = state;
+ 				node->state_changed = 1;
+ 			}

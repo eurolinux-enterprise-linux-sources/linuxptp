@@ -3,7 +3,7 @@
 %global clknetsim_ver ce89a1
 Name:		linuxptp
 Version:	1.8
-Release:	3%{?dist}
+Release:	3%{?dist}.1
 Summary:	PTP implementation for Linux
 
 Group:		System Environment/Base
@@ -30,6 +30,8 @@ Patch3:		linuxptp-swtscheck.patch
 Patch4:		linuxptp-closesocket.patch
 # force BMC election when link goes down
 Patch5:		linuxptp-linkdown.patch
+# Fix phc2sys to check both the state and new_state variables of the clock
+Patch6:   linuxptp-statechange.patch
 
 BuildRequires:	systemd-units
 
@@ -51,6 +53,7 @@ Supporting legacy APIs and other platforms is not a goal.
 %patch3 -p1 -b .swtscheck
 %patch4 -p1 -b .closesocket
 %patch5 -p1 -b .linkdown
+%patch6 -p1 -b .statechange
 mv linuxptp-testsuite-%{testsuite_ver}* testsuite
 mv clknetsim-%{clknetsim_ver}* testsuite/clknetsim
 
@@ -109,6 +112,9 @@ PATH=..:$PATH ./run
 %{_mandir}/man8/*.8*
 
 %changelog
+* Fri Sep 08 2017 Michal Ruprich <mruprich@redhat.com> 1.8-3.1
+- Resolves: #1489425 - Race condition in phc2sys
+
 * Wed Mar 15 2017 Miroslav Lichvar <mlichvar@redhat.com> 1.8-3
 - fix backport of linkdown patch
 
