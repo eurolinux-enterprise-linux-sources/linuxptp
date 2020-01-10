@@ -1,3 +1,4 @@
-# ELS - Enterprise Linux/EuroLinux Sources - linuxptp 
+# ELS - Enterprise Linux/EuroLinux Sources - linuxptp
+ 
 ## Usage:
   Checkout branch or tag.
